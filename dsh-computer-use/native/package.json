@@ -4,8 +4,6 @@
   "description": "Windows Node-API provider for DSH Computer Use",
   "license": "BSD-3-Clause",
   "type": "module",
-  "os": ["win32"],
-  "cpu": ["x64"],
   "main": "index.mjs",
   "types": "index.d.ts",
   "gypfile": true,

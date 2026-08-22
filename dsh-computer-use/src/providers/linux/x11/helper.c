@@ -22,8 +22,6 @@
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
-#include <X11/extensions/Xcomposite.h>
-#include <X11/extensions/XShm.h>
 
 #include <stdio.h>
 #include <stdlib.h>
