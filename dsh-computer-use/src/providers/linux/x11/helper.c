@@ -8,10 +8,12 @@
  *   {"id":1,"method":"listWindows"}
  *   {"id":2,"method":"getWindow","windowId":"x11:xid:0x03400007"}
  *
+ * Protocol contract: every response echoes the request id
+ * ({"id":1,"ok":true,...}). The provider matches responses strictly by id
+ * and drops anything else, so an id-less response is never delivered.
+ *
  * Build (on Linux):
  *   cc -O2 -o dsh-computer-use-x11-helper helper.c -lX11 -lXtst -lXext -lz
- *
- * This file is an implementation draft written before a real Linux build.
  */
 
 #define _XOPEN_SOURCE 700
@@ -237,13 +239,24 @@ static int write_png(const char *path, int width, int height, const unsigned cha
 
   size_t raw_len = (size_t)height * (1 + (size_t)width * 3);
   unsigned char *raw = (unsigned char *)malloc(raw_len);
+  unsigned char *comp = (unsigned char *)malloc(compressBound(raw_len));
+  if (!raw || !comp) {
+    free(raw);
+    free(comp);
+    fclose(fp);
+    return 0;
+  }
   for (int y = 0; y < height; y++) {
     raw[y * (1 + width * 3)] = 0;
     memcpy(raw + y * (1 + width * 3) + 1, rgb + (size_t)y * width * 3, (size_t)width * 3);
   }
   uLongf comp_len = compressBound(raw_len);
-  unsigned char *comp = (unsigned char *)malloc(comp_len);
-  compress2(comp, &comp_len, raw, raw_len, 6);
+  if (compress2(comp, &comp_len, raw, raw_len, 6) != Z_OK) {
+    free(raw);
+    free(comp);
+    fclose(fp);
+    return 0;
+  }
   unsigned char clen[4];
   clen[0] = (comp_len >> 24) & 0xff; clen[1] = (comp_len >> 16) & 0xff;
   clen[2] = (comp_len >> 8) & 0xff; clen[3] = comp_len & 0xff;
@@ -289,6 +302,11 @@ static void method_capture_window(FILE *out, const char *wid, const char *path) 
     return;
   }
   unsigned char *rgb = (unsigned char *)malloc((size_t)attrs.width * attrs.height * 3);
+  if (!rgb) {
+    XDestroyImage(img);
+    fputs("{\"ok\":false,\"code\":\"NATIVE_CAPTURE_FAILED\",\"message\":\"out of memory\",\"recovery\":\"RETRY\"}\n", out);
+    return;
+  }
   for (int y = 0; y < attrs.height; y++) {
     for (int x = 0; x < attrs.width; x++) {
       unsigned long px = XGetPixel(img, x, y);
@@ -330,7 +348,25 @@ static void method_activate_window(FILE *out, const char *wid) {
   ev.xclient.data.l[2] = 0;
   XSendEvent(dpy, DefaultRootWindow(dpy), False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
   XFlush(dpy);
-  fputs("{\"ok\":true,\"value\":true}\n", out);
+  /* The ClientMessage is only a request: the WM may refuse it (focus-stealing
+   * prevention, other workspace) or there may be no WM at all. Poll the
+   * root's _NET_ACTIVE_WINDOW and report success only when the target really
+   * became active — the Node provider injects global XTest input and must
+   * never type into whatever else holds focus. */
+  int verified = 0;
+  for (int i = 0; i < 20 && !verified; i++) {
+    if (i) usleep(25 * 1000);
+    Atom type = None;
+    int format = 0;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *data = NULL;
+    if (XGetWindowProperty(dpy, DefaultRootWindow(dpy), active, 0, 1, False, XA_WINDOW,
+                           &type, &format, &nitems, &bytes_after, &data) == Success && data && nitems > 0) {
+      if (*((Window *)data) == w) verified = 1;
+      XFree(data);
+    }
+  }
+  fprintf(out, "{\"ok\":true,\"value\":%s}\n", verified ? "true" : "false");
 }
 
 /* ------------------------------------------------------------------ */
@@ -348,6 +384,8 @@ static void method_click(FILE *out, const char *xstr, const char *ystr, const ch
   int x = atoi(xstr ? xstr : "0");
   int y = atoi(ystr ? ystr : "0");
   int count = atoi(countstr ? countstr : "1");
+  if (count < 1) count = 1;
+  if (count > 3) count = 3;
   int btn = strcmp(button, "right") == 0 ? 3 : strcmp(button, "middle") == 0 ? 2 : 1;
   XTestFakeMotionEvent(dpy, -1, x, y, CurrentTime);
   for (int i = 0; i < count; i++) {
@@ -427,16 +465,42 @@ static void method_type_text(FILE *out, const char *text) {
   fputs("{\"ok\":true,\"value\":true}\n", out);
 }
 
+/* Every spelling that resolves to the OS-level Super/Meta/Hyper modifier
+ * layer. Blocked before XStringToKeysym so neither aliases ("cmd") nor raw
+ * keysym names ("Super_L", "Meta_R", "Hyper_L") can reach XTest. */
+static const char *BLOCKED_META_NAMES[] = {
+  "super", "cmd", "command", "meta", "win", "windows", "os",
+  "super_l", "super_r", "meta_l", "meta_r",
+  "hyper", "hyper_l", "hyper_r",
+  "leftmeta", "rightmeta", "leftsuper", "rightsuper",
+  "lwin", "rwin", "leftwindows", "rightwindows",
+};
+
+static int is_meta_name(const char *name) {
+  char lower[32];
+  size_t i = 0;
+  for (; name[i] && i + 1 < sizeof(lower); i++) {
+    char c = name[i];
+    lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  }
+  lower[i] = '\0';
+  for (size_t k = 0; k < sizeof(BLOCKED_META_NAMES) / sizeof(BLOCKED_META_NAMES[0]); k++) {
+    if (strcmp(lower, BLOCKED_META_NAMES[k]) == 0) return 1;
+  }
+  return 0;
+}
+
 static KeyCode keycode_for_name(const char *name) {
   if (!name || !*name) return 0;
-  char *end = NULL;
-  long code = strtol(name, &end, 10);
-  if (end && *end == '\0' && code > 0 && code < 256) return (KeyCode)code;
+  /* Numeric keycodes are deliberately NOT accepted: a raw keycode would
+   * inject arbitrary physical keys (whatever Super/Meta map to on this
+   * layout) regardless of every name-based blocklist. Callers send
+   * symbolic names only. */
+  if (is_meta_name(name)) return 0;
   const char *alias = NULL;
   if (strcmp(name, "ctrl") == 0 || strcmp(name, "control") == 0) alias = "Control_L";
   else if (strcmp(name, "shift") == 0) alias = "Shift_L";
   else if (strcmp(name, "alt") == 0 || strcmp(name, "option") == 0) alias = "Alt_L";
-  else if (strcmp(name, "super") == 0 || strcmp(name, "cmd") == 0 || strcmp(name, "command") == 0) alias = "Super_L";
   KeySym ks = XStringToKeysym(alias ? alias : name);
   if (ks == NoSymbol) return 0;
   return XKeysymToKeycode(dpy, ks);
@@ -622,6 +686,7 @@ int main(void) {
   setbuf(stdout, NULL);
   char *line;
   while ((line = read_line(stdin)) != NULL) {
+    char idbuf[64] = "";
     char method[64] = "";
     char wid[256] = "";
     char path[1024] = "";
@@ -635,9 +700,11 @@ int main(void) {
     char fromY[64] = "";
     char toX[64] = "";
     char toY[64] = "";
-    char text[4096] = "";
+    /* Matches the Node runtime's 20 000-char input cap with headroom. */
+    char text[21000] = "";
     char key[256] = "";
 
+    json_field(line, "id", idbuf, sizeof(idbuf));
     json_field(line, "method", method, sizeof(method));
     if (!method[0]) { free(line); continue; }
     json_field(line, "windowId", wid, sizeof(wid));
@@ -655,35 +722,58 @@ int main(void) {
     json_field(line, "text", text, sizeof(text));
     json_field(line, "key", key, sizeof(key));
 
-    if (strcmp(method, "listWindows") == 0) {
-      method_list_windows(stdout);
-    } else if (strcmp(method, "getWindow") == 0 && wid[0]) {
-      method_get_window(stdout, wid);
-    } else if (strcmp(method, "captureWindow") == 0 && wid[0] && path[0]) {
-      method_capture_window(stdout, wid, path);
-    } else if (strcmp(method, "activateWindow") == 0 && wid[0]) {
-      method_activate_window(stdout, wid);
-    } else if (strcmp(method, "moveCursor") == 0 && x[0] && y[0]) {
-      method_move_cursor(stdout, x, y);
-    } else if (strcmp(method, "click") == 0 && button[0] && count[0]) {
-      method_click(stdout, x, y, button, count);
-    } else if (strcmp(method, "typeText") == 0 && text[0]) {
-      method_type_text(stdout, text);
-    } else if (strcmp(method, "pressKey") == 0) {
-      method_press_key(stdout, key);
-    } else if (strcmp(method, "scroll") == 0) {
-      method_scroll(stdout, x[0] ? x : "0", y[0] ? y : "0", scrollX[0] ? scrollX : "0", scrollY[0] ? scrollY : "0");
-    } else if (strcmp(method, "drag") == 0) {
-      method_drag(stdout, fromX[0] ? fromX : "0", fromY[0] ? fromY : "0", toX[0] ? toX : "0", toY[0] ? toY : "0");
-    } else if (strcmp(method, "accessibilityTree") == 0) {
-      method_accessibility_tree(stdout);
-    } else if (strcmp(method, "saveClipboard") == 0) {
-      method_save_clipboard(stdout);
-    } else if (strcmp(method, "restoreClipboard") == 0) {
-      method_restore_clipboard(stdout);
-    } else {
-      fprintf(stdout, "{\"ok\":false,\"code\":\"UNKNOWN_METHOD\",\"message\":\"%s\",\"recovery\":\"NONE\"}\n", method);
+    /* Buffer the response so the request id can be prepended in one place.
+     * The Node provider matches responses strictly by id (concurrent requests
+     * must never receive each other's results); an id-less response is
+     * dropped there, so the echo is part of the protocol contract. */
+    char *body = NULL;
+    size_t bodylen = 0;
+    FILE *resp = open_memstream(&body, &bodylen);
+    if (!resp) {
+      fputs("{\"ok\":false,\"code\":\"HELPER_ERROR\",\"message\":\"out of memory\",\"recovery\":\"RETRY\"}\n", stdout);
+      free(line);
+      continue;
     }
+
+    if (strcmp(method, "listWindows") == 0) {
+      method_list_windows(resp);
+    } else if (strcmp(method, "getWindow") == 0 && wid[0]) {
+      method_get_window(resp, wid);
+    } else if (strcmp(method, "captureWindow") == 0 && wid[0] && path[0]) {
+      method_capture_window(resp, wid, path);
+    } else if (strcmp(method, "activateWindow") == 0 && wid[0]) {
+      method_activate_window(resp, wid);
+    } else if (strcmp(method, "moveCursor") == 0 && x[0] && y[0]) {
+      method_move_cursor(resp, x, y);
+    } else if (strcmp(method, "click") == 0 && button[0] && count[0]) {
+      method_click(resp, x, y, button, count);
+    } else if (strcmp(method, "typeText") == 0 && text[0]) {
+      method_type_text(resp, text);
+    } else if (strcmp(method, "pressKey") == 0) {
+      method_press_key(resp, key);
+    } else if (strcmp(method, "scroll") == 0) {
+      method_scroll(resp, x[0] ? x : "0", y[0] ? y : "0", scrollX[0] ? scrollX : "0", scrollY[0] ? scrollY : "0");
+    } else if (strcmp(method, "drag") == 0) {
+      method_drag(resp, fromX[0] ? fromX : "0", fromY[0] ? fromY : "0", toX[0] ? toX : "0", toY[0] ? toY : "0");
+    } else if (strcmp(method, "accessibilityTree") == 0) {
+      method_accessibility_tree(resp);
+    } else if (strcmp(method, "saveClipboard") == 0) {
+      method_save_clipboard(resp);
+    } else if (strcmp(method, "restoreClipboard") == 0) {
+      method_restore_clipboard(resp);
+    } else {
+      fprintf(resp, "{\"ok\":false,\"code\":\"UNKNOWN_METHOD\",\"message\":\"%s\",\"recovery\":\"NONE\"}\n", method);
+    }
+    fclose(resp);
+
+    if (idbuf[0] && body[0] == '{') {
+      /* Skip the method's opening brace and splice the id in front. The
+       * method body already ends with '\n'. */
+      fprintf(stdout, "{\"id\":%s,%s", idbuf, body + 1);
+    } else if (body[0]) {
+      fputs(body, stdout);
+    }
+    free(body);
     free(line);
   }
   XCloseDisplay(dpy);

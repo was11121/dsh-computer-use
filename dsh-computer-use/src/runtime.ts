@@ -31,6 +31,7 @@ import {
 } from './core/observation.ts'
 import { runClick, runDrag, runPressKey, runScroll, runTypeText } from './core/actions.ts'
 import type { DesktopProvider, DesktopWindow, Rect } from './core/types.ts'
+import { META_KEY_TOKENS } from './core/types.ts'
 
 export { ComputerUseError, type ActionErrorCode, type WindowId }
 export type { Rect }
@@ -92,8 +93,8 @@ export function setApprovalContext(exec: ApprovalExec): void {
   approvalExec = exec
 }
 
-function ensureProvider(): DesktopProvider {
-  if (!provider) provider = createProvider()
+async function ensureProvider(): Promise<DesktopProvider> {
+  if (!provider) provider = await createProvider()
   return provider
 }
 
@@ -101,7 +102,13 @@ async function approveAction(reason: string): Promise<void> {
   const h = hooks
   if (!h) return
   const config = h.getConfig()
-  if (!config.requireApproval || approvalExec === undefined || approvalExec.agent === undefined) return
+  if (!config.requireApproval) return
+  // Fail closed: approval is on, so a tool call without an exec context must be
+  // denied instead of silently running unapproved desktop input.
+  if (approvalExec === undefined || approvalExec.agent === undefined) {
+    await stopControlIndicator()
+    throw new Error('Approval context is missing; this computer-control action is denied')
+  }
   const agent = approvalExec.agent as { session?: { events?: readonly unknown[] } }
   const policy = effectiveApprovalPolicy((agent.session?.events ?? []) as never)
   if (policy === 'never') {
@@ -122,7 +129,7 @@ async function approveAction(reason: string): Promise<void> {
   }
 }
 
-function ensureGuarded(): ReturnType<typeof guardProvider> {
+async function ensureGuarded(): Promise<ReturnType<typeof guardProvider>> {
   if (!guarded) {
     const guardHooks: GuardHooks = {
       assertAllowed() {
@@ -138,7 +145,7 @@ function ensureGuarded(): ReturnType<typeof guardProvider> {
         await approveAction(reason)
       },
     }
-    guarded = guardProvider(ensureProvider(), guardHooks)
+    guarded = guardProvider(await ensureProvider(), guardHooks)
   }
   return guarded
 }
@@ -169,7 +176,7 @@ function hwndNumber(input: number | WindowId): number {
 
 export async function getWindow(id: number | WindowId): Promise<DesktopWindow> {
   try {
-    return await ensureProvider().getWindow(normalizeWindowId(id))
+    return await (await ensureProvider()).getWindow(normalizeWindowId(id))
   } catch {
     throw new ComputerUseError('WINDOW_NOT_FOUND', `Window ${id} does not exist`, 'REQUIRES_REFRESH')
   }
@@ -193,7 +200,7 @@ export async function assertSafeWindow(windowId: number | WindowId, action = 'co
 }
 
 export async function listWindows(): Promise<DesktopWindow[]> {
-  return ensureGuarded().listWindows()
+  return (await ensureGuarded()).listWindows()
 }
 
 /** Windows provider capability report. */
@@ -203,7 +210,7 @@ export function capabilities(): Capabilities {
 
 async function activateNative(id: number | WindowId): Promise<DesktopWindow> {
   const windowId = normalizeWindowId(id)
-  await ensureGuarded().activateWindow(windowId)
+  await (await ensureGuarded()).activateWindow(windowId)
   const current = await getWindow(windowId)
   if (!current.foreground || !current.visible || current.minimized || !current.onScreen || !current.rect.width || !current.rect.height) {
     throw new ComputerUseError('NATIVE_ACTIVATE_FAILED', 'Target window did not become the foreground visible window', 'RETRY')
@@ -242,7 +249,7 @@ export async function validateObservation(
   options: ObservationValidationOptions = {},
 ) {
   const id = normalizeWindowId(windowId)
-  return validateCoreObservation(observationId, id, ensureGuarded(), action, {
+  return validateCoreObservation(observationId, id, await ensureGuarded(), action, {
     requireAccessibilityTree: options.requireAccessibilityTree,
     owner: currentOwner,
   })
@@ -268,7 +275,7 @@ export function point(window: DesktopWindow, x: number, y: number, _observation?
 
 async function elementPoint(windowId: number | WindowId, index: number): Promise<{ x: number; y: number }> {
   try {
-    const tree = await ensureProvider().accessibilityTree(normalizeWindowId(windowId))
+    const tree = await (await ensureProvider()).accessibilityTree(normalizeWindowId(windowId))
     const rect = tree.nodes[index]?.rect
     if (!rect) throw new Error('missing')
     return { x: Math.floor((rect.left + rect.right) / 2), y: Math.floor((rect.top + rect.bottom) / 2) }
@@ -308,7 +315,7 @@ async function hideOverlayNow(fade = false): Promise<void> {
   if (overlay.timer) { clearTimeout(overlay.timer); overlay.timer = undefined }
   if (overlay.pulseTimer) { clearInterval(overlay.pulseTimer); overlay.pulseTimer = undefined }
   if (overlay.visible) {
-    try { await ensureGuarded().stopIndicator() } catch { /* best effort */ }
+    try { await (await ensureGuarded()).stopIndicator() } catch { /* best effort */ }
     overlay.visible = false
   }
 }
@@ -317,12 +324,13 @@ async function syncOverlay(windowId: number | WindowId = 0): Promise<void> {
   if (!overlay.config.overlayEnabled) return
   try {
     if (!overlay.visible) {
-      await ensureGuarded().startIndicator(windowId ? normalizeWindowId(windowId) : undefined)
+      await (await ensureGuarded()).startIndicator(windowId ? normalizeWindowId(windowId) : undefined)
       overlay.visible = true
     }
     if (overlay.timer) clearTimeout(overlay.timer)
     if (overlay.pulseTimer) clearInterval(overlay.pulseTimer)
-    const pulse = ensureProvider().refreshIndicator
+    const native = await ensureProvider()
+    const pulse = native.refreshIndicator
     if (pulse) overlay.pulseTimer = setInterval(() => { void pulse().catch(() => undefined) }, 100)
     overlay.timer = setTimeout(() => void hideOverlayNow(true), Math.max(1_000, overlay.config.overlayIdleMs))
   } catch { /* overlay is best effort */ }
@@ -342,7 +350,7 @@ export async function capture(windowId: number | WindowId, path: string): Promis
   const wasVisible = overlay.visible
   await hideOverlayNow(false)
   try {
-    const result = await ensureGuarded().captureWindow(normalizeWindowId(windowId), path)
+    const result = await (await ensureGuarded()).captureWindow(normalizeWindowId(windowId), path)
     return { path: result.path, rect: result.rect }
   } finally {
     if (wasVisible) await syncOverlay(windowId)
@@ -382,7 +390,7 @@ export async function click(
   }
   try {
     const result = await runClick(
-      { provider: ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id },
+      { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id },
       { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' },
     )
     await showOverlay(id)
@@ -401,7 +409,7 @@ export async function typeText(windowId: number | WindowId, value: string, obser
   await assertSafeWindow(id, 'type')
   if (value.length > 20_000) throw new ComputerUseError('INPUT_TOO_LARGE', 'A single input supports at most 20000 characters', 'DENY')
   const result = await runTypeText(
-    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` },
+    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` },
     value,
   )
   await showOverlay(id)
@@ -427,14 +435,16 @@ export async function pressKey(windowId: number | WindowId, value: string, obser
   await actionObservation(observation, id, 'press key')
   await assertSafeWindow(id, 'press key')
   // Reject meta keys and system chords before anything leaves this process.
+  // The shared token set covers X11 keysym aliases (super_l, meta_l, ...) so
+  // they cannot reach a helper that resolves raw keysym names.
   const tokens = value.split('+').map((x) => x.trim().toLowerCase()).filter(Boolean)
-  if (!tokens.length || tokens.some((x) => ['win', 'windows', 'meta', 'cmd', 'command', 'super', 'os'].includes(x))) {
+  if (!tokens.length || tokens.some((x) => META_KEY_TOKENS.has(x))) {
     throw new ComputerUseError('FORBIDDEN_KEY', 'Windows/Meta shortcuts are not allowed', 'DENY')
   }
   const main = tokens.pop()!
   if (isForbiddenChord(tokens, main)) throw new ComputerUseError('FORBIDDEN_KEY', 'System shortcut combinations are not allowed', 'DENY')
   const result = await runPressKey(
-    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id },
+    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id },
     value,
   )
   await showOverlay(id)
@@ -471,7 +481,7 @@ export async function scroll(
     space = 'screen'
   }
   const result = await runScroll(
-    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id },
+    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id },
     { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space },
   )
   await showOverlay(id)
@@ -505,7 +515,7 @@ export async function drag(
     await actionObservation(observation, id, 'drag', true)
   }
   const result = await runDrag(
-    { provider: ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id },
+    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id },
     { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' },
   )
   await showOverlay(id)
@@ -516,7 +526,7 @@ export async function accessibilityTree(windowId: number | WindowId): Promise<{ 
   await assertSafeWindow(windowId, 'UIA read')
   void TREE_MAX_NODES
   void TREE_MAX_DEPTH
-  return ensureProvider().accessibilityTree(normalizeWindowId(windowId))
+  return (await ensureProvider()).accessibilityTree(normalizeWindowId(windowId))
 }
 
 export async function disposeRuntime(): Promise<void> {
@@ -540,7 +550,7 @@ export async function stopControlIndicator(): Promise<void> {
 export async function launchApp(app: unknown, args: readonly unknown[] = []): Promise<object> {
   const { checkLaunchApp } = await import('./core/app-launch.ts')
   const { app: safeApp, args: safeArgs } = checkLaunchApp(app, args)
-  const result = await ensureGuarded().launchApp({ app: safeApp, args: safeArgs })
+  const result = await (await ensureGuarded()).launchApp({ app: safeApp, args: safeArgs })
   await showOverlay()
   return {
     launched: result.launched,

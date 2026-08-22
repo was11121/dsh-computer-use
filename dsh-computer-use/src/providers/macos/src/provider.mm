@@ -140,7 +140,6 @@ static Napi::Value GetWindow(const Napi::CallbackInfo &info) {
     return env.Undefined();
   }
   NSNumber *number = w[(__bridge NSString *)kCGWindowNumber];
-  NSNumber *ownerPid = w[(__bridge NSString *)kCGWindowOwnerPID];
   NSString *name = w[(__bridge NSString *)kCGWindowName];
   NSString *owner = w[(__bridge NSString *)kCGWindowOwnerName];
   NSDictionary *bounds = w[(__bridge NSString *)kCGWindowBounds];
@@ -564,7 +563,13 @@ static Napi::Value RuntimeInfo(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
   Napi::Object o = Napi::Object::New(env);
   o.Set("platform", JsString(env, "darwin"));
-  o.Set("arch", JsString(env, sizeof(void*) == 8 ? "arm64" : "x64"));
+#if defined(__arm64__) || defined(__aarch64__)
+  o.Set("arch", JsString(env, "arm64"));
+#elif defined(__x86_64__) || defined(__amd64__)
+  o.Set("arch", JsString(env, "x64"));
+#else
+  o.Set("arch", JsString(env, "unknown"));
+#endif
   o.Set("node", JsString(env, NODE_VERSION));
   o.Set("napi", env.Undefined());
   return o;

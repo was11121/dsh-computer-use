@@ -43,6 +43,9 @@ import type {
 
 const TREE_MAX_NODES = 2000
 const TREE_MAX_DEPTH = 32
+// Per-call cap for the SendInput text fallback (~10ms/char native pacing
+// blocks the event loop: 1000 chars ≈ 10s, the largest freeze we accept).
+const SENDINPUT_TEXT_LIMIT = 1000
 
 // Windows VK codes for the computer_press_key tool. Kept in the Windows
 // provider so it does not depend on the legacy runtime observation path.
@@ -165,6 +168,7 @@ export class WindowsProvider implements DesktopProvider {
   async captureWindow(id: WindowId, path: string): Promise<CaptureResult> {
     const value = hwnd(id)
     const window = native.getWindow(value)
+    if (!window) throw new ComputerUseError('WINDOW_NOT_FOUND', `Window ${id} does not exist`, 'REQUIRES_REFRESH')
     const rect = window.rect
     // Restore a minimized target so its own content can be captured. The
     // native layer captures the window itself (PrintWindow first, screen
@@ -265,6 +269,17 @@ export class WindowsProvider implements DesktopProvider {
       }
     } finally {
       if (saved) native.restoreClipboard(key)
+    }
+    // The native SendInput fallback paces at ~10ms per char and blocks the JS
+    // event loop, so a large payload would freeze the engine for minutes —
+    // tool timeouts cannot even fire while the native call blocks. The
+    // clipboard path above handles large payloads; keep the fallback bounded.
+    if (request.text.length > SENDINPUT_TEXT_LIMIT) {
+      throw new ComputerUseError(
+        'INPUT_TOO_LARGE',
+        `Clipboard paste is unavailable and the keyboard fallback supports at most ${SENDINPUT_TEXT_LIMIT} characters per call; please type in smaller chunks`,
+        'DENY',
+      )
     }
     if (native.typeText(request.text)) {
       return toActionResult('sendinput-unicode', { chars: request.text.length })
@@ -411,6 +426,7 @@ export class WindowsProvider implements DesktopProvider {
 
   private toScreenPoint(request: { windowId: WindowId; x: number; y: number; coordinateSpace?: string }): { x: number; y: number } {
     const window = native.getWindow(hwnd(request.windowId))
+    if (!window) throw new ComputerUseError('WINDOW_NOT_FOUND', `Window ${request.windowId} does not exist`, 'REQUIRES_REFRESH')
     const r = window.rect
     const space = request.coordinateSpace ?? 'auto'
     if (space === 'screen') {

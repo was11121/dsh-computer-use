@@ -13,6 +13,11 @@ export interface BrandedWindowInput {
  * True when a window belongs to DSH / DeepSeek / Harness.
  *
  * Process-path segments are matched (not substrings) so a program living in a
- * folder like `dsh-stuff` or `mysandsh` is not mistaken for DSH itself.
+ * folder like `dsh-stuff` or `mysandsh` is not mistaken for DSH itself. The
+ * executable extension is stripped per segment so a bare `dsh.exe` /
+ * `deepseek.exe` process is recognized as DSH too. Titles match whole words:
+ * `dsh`, `deepseek` or `harness` anywhere in the title (e.g. a console titled
+ * `node D:\DSH\engine`) marks the window protected — over-blocking a random
+ * window is the safe direction for a self-control guard.
  */
 export declare function brandProtected(window: BrandedWindowInput): boolean;

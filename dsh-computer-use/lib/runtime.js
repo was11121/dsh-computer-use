@@ -23,6 +23,7 @@ import { guardProvider } from "./core/guard.js";
 import { createProvider } from "./providers/index.js";
 import { createObservation as createCoreObservation, validateObservation as validateCoreObservation, __clearObservationsForTest, } from "./core/observation.js";
 import { runClick, runDrag, runPressKey, runScroll, runTypeText } from "./core/actions.js";
+import { META_KEY_TOKENS } from "./core/types.js";
 export { ComputerUseError };
 const protectedWindows = new Map();
 const PROTECTED_WINDOWS_CAP = 512;
@@ -41,9 +42,9 @@ export function initRuntime(h) {
 export function setApprovalContext(exec) {
     approvalExec = exec;
 }
-function ensureProvider() {
+async function ensureProvider() {
     if (!provider)
-        provider = createProvider();
+        provider = await createProvider();
     return provider;
 }
 async function approveAction(reason) {
@@ -51,8 +52,14 @@ async function approveAction(reason) {
     if (!h)
         return;
     const config = h.getConfig();
-    if (!config.requireApproval || approvalExec === undefined || approvalExec.agent === undefined)
+    if (!config.requireApproval)
         return;
+    // Fail closed: approval is on, so a tool call without an exec context must be
+    // denied instead of silently running unapproved desktop input.
+    if (approvalExec === undefined || approvalExec.agent === undefined) {
+        await stopControlIndicator();
+        throw new Error('Approval context is missing; this computer-control action is denied');
+    }
     const agent = approvalExec.agent;
     const policy = effectiveApprovalPolicy((agent.session?.events ?? []));
     if (policy === 'never') {
@@ -73,7 +80,7 @@ async function approveAction(reason) {
         throw new Error('The user rejected this computer-control action');
     }
 }
-function ensureGuarded() {
+async function ensureGuarded() {
     if (!guarded) {
         const guardHooks = {
             assertAllowed() {
@@ -92,7 +99,7 @@ function ensureGuarded() {
                 await approveAction(reason);
             },
         };
-        guarded = guardProvider(ensureProvider(), guardHooks);
+        guarded = guardProvider(await ensureProvider(), guardHooks);
     }
     return guarded;
 }
@@ -118,7 +125,7 @@ function hwndNumber(input) {
 // ---------------------------------------------------------------------------
 export async function getWindow(id) {
     try {
-        return await ensureProvider().getWindow(normalizeWindowId(id));
+        return await (await ensureProvider()).getWindow(normalizeWindowId(id));
     }
     catch {
         throw new ComputerUseError('WINDOW_NOT_FOUND', `Window ${id} does not exist`, 'REQUIRES_REFRESH');
@@ -142,7 +149,7 @@ export async function assertSafeWindow(windowId, action = 'control') {
     return window;
 }
 export async function listWindows() {
-    return ensureGuarded().listWindows();
+    return (await ensureGuarded()).listWindows();
 }
 /** Windows provider capability report. */
 export function capabilities() {
@@ -150,7 +157,7 @@ export function capabilities() {
 }
 async function activateNative(id) {
     const windowId = normalizeWindowId(id);
-    await ensureGuarded().activateWindow(windowId);
+    await (await ensureGuarded()).activateWindow(windowId);
     const current = await getWindow(windowId);
     if (!current.foreground || !current.visible || current.minimized || !current.onScreen || !current.rect.width || !current.rect.height) {
         throw new ComputerUseError('NATIVE_ACTIVATE_FAILED', 'Target window did not become the foreground visible window', 'RETRY');
@@ -176,7 +183,7 @@ export async function createObservation(windowId, value) {
 }
 export async function validateObservation(observationId, windowId, action, options = {}) {
     const id = normalizeWindowId(windowId);
-    return validateCoreObservation(observationId, id, ensureGuarded(), action, {
+    return validateCoreObservation(observationId, id, await ensureGuarded(), action, {
         requireAccessibilityTree: options.requireAccessibilityTree,
         owner: currentOwner,
     });
@@ -192,7 +199,7 @@ export function point(window, x, y, _observation, coordinateSpace = 'auto') {
 }
 async function elementPoint(windowId, index) {
     try {
-        const tree = await ensureProvider().accessibilityTree(normalizeWindowId(windowId));
+        const tree = await (await ensureProvider()).accessibilityTree(normalizeWindowId(windowId));
         const rect = tree.nodes[index]?.rect;
         if (!rect)
             throw new Error('missing');
@@ -223,7 +230,7 @@ async function hideOverlayNow(fade = false) {
     }
     if (overlay.visible) {
         try {
-            await ensureGuarded().stopIndicator();
+            await (await ensureGuarded()).stopIndicator();
         }
         catch { /* best effort */ }
         overlay.visible = false;
@@ -234,14 +241,15 @@ async function syncOverlay(windowId = 0) {
         return;
     try {
         if (!overlay.visible) {
-            await ensureGuarded().startIndicator(windowId ? normalizeWindowId(windowId) : undefined);
+            await (await ensureGuarded()).startIndicator(windowId ? normalizeWindowId(windowId) : undefined);
             overlay.visible = true;
         }
         if (overlay.timer)
             clearTimeout(overlay.timer);
         if (overlay.pulseTimer)
             clearInterval(overlay.pulseTimer);
-        const pulse = ensureProvider().refreshIndicator;
+        const native = await ensureProvider();
+        const pulse = native.refreshIndicator;
         if (pulse)
             overlay.pulseTimer = setInterval(() => { void pulse().catch(() => undefined); }, 100);
         overlay.timer = setTimeout(() => void hideOverlayNow(true), Math.max(1_000, overlay.config.overlayIdleMs));
@@ -260,7 +268,7 @@ export async function capture(windowId, path) {
     const wasVisible = overlay.visible;
     await hideOverlayNow(false);
     try {
-        const result = await ensureGuarded().captureWindow(normalizeWindowId(windowId), path);
+        const result = await (await ensureGuarded()).captureWindow(normalizeWindowId(windowId), path);
         return { path: result.path, rect: result.rect };
     }
     finally {
@@ -288,7 +296,7 @@ export async function click(windowId, x, y, button, count, observation, coordina
         space = 'screen';
     }
     try {
-        const result = await runClick({ provider: ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id }, { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' });
+        const result = await runClick({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id }, { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' });
         await showOverlay(id);
         const details = result.details;
         return { clicked: true, x, y, screenX: details?.x, screenY: details?.y, method: result.method };
@@ -305,7 +313,7 @@ export async function typeText(windowId, value, observation) {
     await assertSafeWindow(id, 'type');
     if (value.length > 20_000)
         throw new ComputerUseError('INPUT_TOO_LARGE', 'A single input supports at most 20000 characters', 'DENY');
-    const result = await runTypeText({ provider: ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` }, value);
+    const result = await runTypeText({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` }, value);
     await showOverlay(id);
     return { typed: true, chars: value.length, method: result.method };
 }
@@ -328,14 +336,16 @@ export async function pressKey(windowId, value, observation) {
     await actionObservation(observation, id, 'press key');
     await assertSafeWindow(id, 'press key');
     // Reject meta keys and system chords before anything leaves this process.
+    // The shared token set covers X11 keysym aliases (super_l, meta_l, ...) so
+    // they cannot reach a helper that resolves raw keysym names.
     const tokens = value.split('+').map((x) => x.trim().toLowerCase()).filter(Boolean);
-    if (!tokens.length || tokens.some((x) => ['win', 'windows', 'meta', 'cmd', 'command', 'super', 'os'].includes(x))) {
+    if (!tokens.length || tokens.some((x) => META_KEY_TOKENS.has(x))) {
         throw new ComputerUseError('FORBIDDEN_KEY', 'Windows/Meta shortcuts are not allowed', 'DENY');
     }
     const main = tokens.pop();
     if (isForbiddenChord(tokens, main))
         throw new ComputerUseError('FORBIDDEN_KEY', 'System shortcut combinations are not allowed', 'DENY');
-    const result = await runPressKey({ provider: ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id }, value);
+    const result = await runPressKey({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id }, value);
     await showOverlay(id);
     return { pressed: true, key: value, modifiers: result.details?.modifiers ?? 0 };
 }
@@ -358,7 +368,7 @@ export async function scroll(windowId, x, y, scrollX, scrollY, observation, coor
         py = center.y;
         space = 'screen';
     }
-    const result = await runScroll({ provider: ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id }, { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space });
+    const result = await runScroll({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id }, { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space });
     await showOverlay(id);
     const details = result.details;
     return { scrolled: true, x, y, scrollX: details?.scrollX ?? dx, scrollY: details?.scrollY ?? dy, method: result.method };
@@ -376,7 +386,7 @@ export async function drag(windowId, fromX, fromY, toX, toY, observation, coordi
     if (options.fromElementIndex !== undefined || options.toElementIndex !== undefined) {
         await actionObservation(observation, id, 'drag', true);
     }
-    const result = await runDrag({ provider: ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id }, { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' });
+    const result = await runDrag({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id }, { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' });
     await showOverlay(id);
     return { dragged: true, from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, method: result.method };
 }
@@ -384,7 +394,7 @@ export async function accessibilityTree(windowId) {
     await assertSafeWindow(windowId, 'UIA read');
     void TREE_MAX_NODES;
     void TREE_MAX_DEPTH;
-    return ensureProvider().accessibilityTree(normalizeWindowId(windowId));
+    return (await ensureProvider()).accessibilityTree(normalizeWindowId(windowId));
 }
 export async function disposeRuntime() {
     __clearObservationsForTest();
@@ -407,7 +417,7 @@ export async function stopControlIndicator() {
 export async function launchApp(app, args = []) {
     const { checkLaunchApp } = await import("./core/app-launch.js");
     const { app: safeApp, args: safeArgs } = checkLaunchApp(app, args);
-    const result = await ensureGuarded().launchApp({ app: safeApp, args: safeArgs });
+    const result = await (await ensureGuarded()).launchApp({ app: safeApp, args: safeArgs });
     await showOverlay();
     return {
         launched: result.launched,

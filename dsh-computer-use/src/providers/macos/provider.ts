@@ -170,6 +170,7 @@ export class MacosProvider implements DesktopProvider {
   async captureWindow(id: string, path: string): Promise<CaptureResult> {
     const native = await this.native()
     const window = native.getWindow(id)
+    if (!window) throw new ComputerUseError('WINDOW_NOT_FOUND', `Window ${id} does not exist`, 'REQUIRES_REFRESH')
     if (!native.captureWindow(id, path)) {
       throw new ComputerUseError('NATIVE_CAPTURE_FAILED', 'Window capture failed', 'RETRY')
     }
@@ -229,10 +230,23 @@ export class MacosProvider implements DesktopProvider {
     const saved = native.saveClipboard(key)
     try {
       if (saved && native.setClipboardText(request.text) && native.paste()) {
+        // Cmd+V is processed asynchronously by the target; give it time to
+        // read the clipboard before restoring the previous content (same
+        // settle delay as the Windows provider).
+        await new Promise((resolve) => setTimeout(resolve, 300))
         return { ok: true, method: 'clipboard-paste', details: { chars: request.text.length } }
       }
     } finally {
       if (saved) native.restoreClipboard(key)
+    }
+    // Mirror the Windows cap: the per-char injection fallback must stay
+    // bounded in case a native implementation paces keystrokes.
+    if (request.text.length > 1000) {
+      throw new ComputerUseError(
+        'INPUT_TOO_LARGE',
+        'Clipboard paste is unavailable and the keyboard fallback supports at most 1000 characters per call; please type in smaller chunks',
+        'DENY',
+      )
     }
     if (native.typeText(request.text)) {
       return { ok: true, method: 'unicode-injection', details: { chars: request.text.length } }
@@ -318,15 +332,21 @@ export class MacosProvider implements DesktopProvider {
     return native.restoreClipboard(typeof key === 'string' ? key : 'default')
   }
 
+  private overlayHandle = 0
+
   async startIndicator(target?: string): Promise<void> {
     const native = await this.native()
-    const handle = native.overlayCreate()
-    native.overlayShow(handle, target ?? '', 'DSH is operating the computer')
+    if (!this.overlayHandle) {
+      try { this.overlayHandle = native.overlayCreate() } catch { return }
+    }
+    try { native.overlayShow(this.overlayHandle, target ?? '', 'DSH is operating the computer') } catch { /* best effort */ }
   }
 
   async stopIndicator(): Promise<void> {
     const native = await this.native()
-    native.overlayHide(0, true)
+    if (this.overlayHandle) {
+      try { native.overlayHide(this.overlayHandle, true) } catch { /* best effort */ }
+    }
   }
 
   async dispose(): Promise<void> {

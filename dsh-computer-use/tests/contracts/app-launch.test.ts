@@ -60,3 +60,27 @@ test('launch hardening case-insensitive on basenames', () => {
   blocked('C:\\WINDOWS\\SYSTEM32\\CMD.EXE')
   blocked('C:\\Windows\\System32\\PowerShell.EXE')
 })
+
+test('launch hardening blocks script, shortcut and installer files by extension', () => {
+  // spawn() executes .bat/.cmd via cmd.exe even with an arbitrary name, so the
+  // blocked-name list alone cannot stop a renamed script.
+  blocked('C:\\Users\\me\\Downloads\\payload.bat')
+  blocked('C:\\Users\\me\\Downloads\\update.cmd')
+  blocked('C:\\temp\\setup.ps1')
+  blocked('C:\\temp\\macro.vbs')
+  blocked('C:\\temp\\page.hta')
+  blocked('C:\\temp\\installer.msi')
+  blocked('C:\\temp\\link.lnk')
+  blocked('C:\\temp\\site.url')
+  blocked('C:\\temp\\tool.js')
+  blocked('C:\\temp\\merge.reg')
+  blocked('C:\\temp\\app.JAR')
+  blocked('/tmp/install.sh')
+  blocked('/tmp/run.py')
+})
+
+test('launch hardening still allows plain executables and extensionless names', () => {
+  assert.equal(checkLaunchApp('calc.exe').app, 'calc.exe')
+  assert.equal(checkLaunchApp('C:\\Program Files\\Microsoft VS Code\\Code.exe').app, 'C:\\Program Files\\Microsoft VS Code\\Code.exe')
+  assert.equal(checkLaunchApp('notepad').app, 'notepad')
+})

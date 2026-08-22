@@ -9,6 +9,7 @@
  */
 
 import { ComputerUseError } from '../../../core/errors.ts'
+import { checkLaunchApp } from '../../../core/app-launch.ts'
 import type { Capabilities } from '../../../core/capability.ts'
 import type {
   ActionResult,
@@ -108,12 +109,10 @@ export class WaylandProvider implements DesktopProvider {
 
   async launchApp(request: LaunchRequest): Promise<LaunchResult> {
     const { spawn } = await import('node:child_process')
-    const app = request.app.trim()
-    if (!app || app.includes('..')) throw new ComputerUseError('UNSAFE_APP', 'Unsafe application path', 'DENY')
-    const blocked = ['cmd.exe','cmd','powershell.exe','powershell','pwsh.exe','pwsh','wscript.exe','wscript','cscript.exe','cscript','mshta.exe','mshta','regedit.exe','regedit','taskmgr.exe','taskmgr']
-    const base = app.toLowerCase().split(/[\/]/).pop() ?? app.toLowerCase()
-    if (blocked.includes(base)) throw new ComputerUseError('UNSAFE_APP', 'This application is blocked for computer-use launch', 'DENY')
-    const args = request.args?.map(String) ?? []
+    // Shared hardening (blocked shells/interpreters, control chars, script
+    // extensions); a local re-implementation here previously let `bash -c ...`
+    // through because the duplicated blocklist only carried Windows names.
+    const { app, args } = checkLaunchApp(request.app, request.args)
     const child = spawn(app, args, { detached: true, stdio: 'ignore' })
     child.unref()
     const started = await new Promise<boolean>((resolve) => {

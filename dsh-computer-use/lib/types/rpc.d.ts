@@ -3,6 +3,12 @@
  * toggle the desktop-control permission (`allowControl`) without relying on
  * the Host api-proxy settings allowlist — third-party namespaces are not
  * exposed to the browser by default, so the bubble must ride its own channel.
+ *
+ * Trust boundary: `authority: 'loopback'` only filters at the HTTP fence
+ * (loopback Host header, no cross-site fetch metadata). Scripts inside the
+ * DSH web realm (every installed client plugin shares one window) and any
+ * local process can still reach this channel, so every flip of the master
+ * control switch is validated strictly and written to the log for audit.
  * @module
  */
 import type { Context } from '@deepseek-ai/cordis';

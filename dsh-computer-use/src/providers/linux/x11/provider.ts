@@ -3,15 +3,19 @@
  *
  * Talks to a long-lived native helper process over JSON-lines on stdio. The
  * helper owns the X11/XTest/AT-SPI connections; Node never links Xlib directly.
- * The helper binary does not ship in this repo yet, so calls fail with
- * `NATIVE_PROVIDER_UNAVAILABLE` when it is absent.
+ * The helper source ships at `src/providers/linux/x11/helper.c` (build with
+ * `make -C src/providers/linux/x11`); when the binary is not installed and no
+ * absolute `DSH_COMPUTER_USE_X11_HELPER` override is set, calls fail with
+ * `NATIVE_PROVIDER_UNAVAILABLE`.
  * @module
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface, type Interface } from 'node:readline'
+import { isAbsolute } from 'node:path'
 import { ComputerUseError } from '../../../core/errors.ts'
 import { checkLaunchApp } from '../../../core/app-launch.ts'
+import { META_KEY_TOKENS } from '../../../core/types.ts'
 import type { Capabilities } from '../../../core/capability.ts'
 import type {
   AccessibilityNode,
@@ -70,7 +74,18 @@ export class X11Provider implements DesktopProvider {
   private nextId = 1
 
   private helperPath(): string {
-    return process.env.DSH_COMPUTER_USE_X11_HELPER ?? 'dsh-computer-use-x11-helper'
+    const override = process.env.DSH_COMPUTER_USE_X11_HELPER
+    if (override === undefined || override === '') return 'dsh-computer-use-x11-helper'
+    // An env override must pin an absolute path: a relative value would be
+    // resolved through PATH, so any planted binary with that name would run.
+    if (!isAbsolute(override)) {
+      throw new ComputerUseError(
+        'NATIVE_PROVIDER_UNAVAILABLE',
+        'DSH_COMPUTER_USE_X11_HELPER must be an absolute path to the helper binary',
+        'NONE',
+      )
+    }
+    return override
   }
 
   private async ensureHelper(): Promise<void> {
@@ -78,34 +93,38 @@ export class X11Provider implements DesktopProvider {
     const helper = this.helperPath()
     try {
       const child = spawn(helper, [], { stdio: ['pipe', 'pipe', 'inherit'] })
-      this.child = child as unknown as ChildProcessWithoutNullStreams
-      this.lines = createInterface({ input: this.child.stdout })
-      this.lines.on('line', (line) => {
-        let msg: HelperResponse
-        try { msg = JSON.parse(line) as HelperResponse } catch { return }
-        let entry: { resolve: (v: unknown) => void; reject: (e: Error) => void } | undefined
-        if (typeof msg.id === 'number' && this.pending.has(msg.id)) {
-          entry = this.pending.get(msg.id)!
-          this.pending.delete(msg.id)
-        } else {
-          // The helper may respond without echoing ids (single serialized
-          // connection); fall back to FIFO matching.
-          const first = this.pending.entries().next().value
-          if (!first) return
-          entry = first[1]
-          this.pending.delete(first[0])
-        }
-        if (msg.ok) entry.resolve(msg.value)
-        else entry.reject(new ComputerUseError(msg.code ?? 'HELPER_ERROR', msg.message ?? 'X11 helper error', (msg.recovery as never) ?? 'RETRY'))
-      })
-      this.child.on('exit', () => {
+      const cleanup = () => {
         for (const [, entry] of this.pending) {
           entry.reject(new ComputerUseError('NATIVE_PROVIDER_UNAVAILABLE', 'X11 helper exited unexpectedly', 'RETRY'))
         }
         this.pending.clear()
         this.child = null
         this.lines = null
+      }
+      // spawn() reports ENOENT and other launch failures asynchronously via
+      // 'error'; without a listener Node rethrows it and takes the whole
+      // engine down. Same cleanup as the 'exit' path.
+      child.on('error', () => cleanup())
+      // Destroyed/EPIPE'd stdio streams emit 'error' on the stream itself;
+      // swallow it and let the error/exit cleanup reject the pending calls.
+      child.stdin?.on('error', () => { /* handled by cleanup */ })
+      child.stdout?.on('error', () => { /* handled by cleanup */ })
+      this.child = child as unknown as ChildProcessWithoutNullStreams
+      this.lines = createInterface({ input: this.child.stdout })
+      this.lines.on('line', (line) => {
+        let msg: HelperResponse
+        try { msg = JSON.parse(line) as HelperResponse } catch { return }
+        // Responses must echo the request id. Matching anything else (the old
+        // FIFO fallback) misattributes late or out-of-order responses to the
+        // wrong pending call under concurrency.
+        if (typeof msg.id !== 'number') return
+        const entry = this.pending.get(msg.id)
+        if (!entry) return
+        this.pending.delete(msg.id)
+        if (msg.ok) entry.resolve(msg.value)
+        else entry.reject(new ComputerUseError(msg.code ?? 'HELPER_ERROR', msg.message ?? 'X11 helper error', (msg.recovery as never) ?? 'RETRY'))
       })
+      child.on('exit', () => cleanup())
     } catch {
       throw new ComputerUseError('NATIVE_PROVIDER_UNAVAILABLE', `X11 helper not found: ${helper}`, 'RETRY')
     }
@@ -115,13 +134,25 @@ export class X11Provider implements DesktopProvider {
     await this.ensureHelper()
     const id = this.nextId++
     return new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const settle = {
+        resolve: (v: unknown) => { if (timer) clearTimeout(timer); resolve(v) },
+        reject: (e: Error) => { if (timer) clearTimeout(timer); reject(e) },
+      }
+      this.pending.set(id, settle)
       const payload = JSON.stringify({ id, method, ...params })
-      this.child!.stdin.write(payload + '\n')
-      // Safety timeout: a dead helper should not hang the model forever.
-      setTimeout(() => {
-        if (this.pending.delete(id)) reject(new ComputerUseError('X11_HELPER_TIMEOUT', `X11 helper timed out for ${method}`, 'RETRY'))
+      try {
+        this.child!.stdin.write(payload + '\n')
+      } catch {
+        // The helper may have died between ensureHelper() and this write; the
+        // error/exit cleanup rejects the pending entry.
+      }
+      // Safety timeout: a dead helper should not hang the model forever, and
+      // unref keeps an in-flight call from delaying engine shutdown.
+      timer = setTimeout(() => {
+        if (this.pending.delete(id)) settle.reject(new ComputerUseError('X11_HELPER_TIMEOUT', `X11 helper timed out for ${method}`, 'RETRY'))
       }, 60_000)
+      timer.unref()
     })
   }
 
@@ -170,7 +201,14 @@ export class X11Provider implements DesktopProvider {
   }
 
   async activateWindow(id: string): Promise<void> {
-    await this.request('activateWindow', { windowId: id })
+    // XTest input is injected globally: if the helper cannot raise the window,
+    // sending input anyway would hit whatever window currently has focus. The
+    // helper must therefore confirm activation explicitly (contract: returns
+    // true) — anything else fails closed.
+    const activated = await this.request('activateWindow', { windowId: id })
+    if (activated !== true) {
+      throw new ComputerUseError('NATIVE_ACTIVATE_FAILED', 'Target window could not be activated or is not on screen', 'RETRY')
+    }
   }
 
   async accessibilityTree(id: string): Promise<AccessibilitySnapshot> {
@@ -195,7 +233,10 @@ export class X11Provider implements DesktopProvider {
 
   async pressKey(request: PressKeyRequest): Promise<ActionResult> {
     const tokens = request.key.split('+').map((t) => t.trim().toLowerCase()).filter(Boolean)
-    if (tokens.some((t) => ['win', 'windows', 'meta', 'cmd', 'command', 'super', 'os'].includes(t))) {
+    // The raw key string is forwarded to the helper, which may resolve X11
+    // keysym names: block every Meta/Super/Hyper spelling (super_l, meta_l,
+    // hyper_l, ...) before it leaves this process.
+    if (!tokens.length || tokens.some((t) => META_KEY_TOKENS.has(t))) {
       throw new ComputerUseError('FORBIDDEN_KEY', 'Windows/Meta shortcuts are not allowed', 'DENY')
     }
     const main = tokens.pop()!
@@ -259,6 +300,9 @@ export class X11Provider implements DesktopProvider {
     }
     this.child = null
     this.lines = null
+    for (const [, entry] of this.pending) {
+      entry.reject(new ComputerUseError('NATIVE_PROVIDER_UNAVAILABLE', 'X11 provider disposed', 'NONE'))
+    }
     this.pending.clear()
   }
 

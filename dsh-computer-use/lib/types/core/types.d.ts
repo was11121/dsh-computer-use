@@ -208,5 +208,13 @@ export interface DesktopProvider {
 }
 /** Error raised when a capability is completely unavailable. */
 export declare function capabilityUnavailable(capability: keyof Capabilities): Error;
+/**
+ * Every key token that means an OS-level Meta/Super/Hyper modifier, across the
+ * Windows, macOS and X11 naming schemes. All press-key filters match against
+ * this set (tokens are lowercased before checking): the plain spellings alone
+ * let X11 keysym names such as `super_l`/`meta_l`/`hyper_l` reach the native
+ * layer and open system UI (Activities, launchers, OS shortcuts).
+ */
+export declare const META_KEY_TOKENS: ReadonlySet<string>;
 /** Convenience: map a CapabilityState to a boolean/unavailable error. */
 export declare function assertCapability(state: CapabilityState, capability: keyof Capabilities): void;

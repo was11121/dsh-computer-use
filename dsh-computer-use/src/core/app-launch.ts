@@ -55,6 +55,28 @@ function hasControlChars(value: string): boolean {
 }
 
 /**
+ * Extensions that make the OS execute a file as a script/program rather than
+ * open it as a document. On Windows `spawn()` runs `.bat`/`.cmd` through
+ * cmd.exe, so the blocked-name list alone cannot stop a renamed script: any
+ * file carrying one of these extensions is denied outright.
+ */
+const BLOCKED_LAUNCH_EXTENSIONS = new Set([
+  // Windows: CreateProcess executes these (directly or via a script host)
+  '.bat', '.cmd', '.com',
+  '.ps1', '.psm1', '.psd1',
+  '.vbs', '.vbe', '.js', '.jse', '.ws', '.wsf', '.wsh', '.wsc', '.hta',
+  '.msi', '.msp', '.mst', '.msc', '.cpl', '.scr', '.pif',
+  '.reg', // registry merge
+  // Shortcut indirection: resolves to an arbitrary target, bypassing every
+  // name check here
+  '.lnk', '.url', '.scf', '.shb', '.appref-ms',
+  // Unix shells / interpreters (kept for cross-platform parity)
+  '.sh', '.bash', '.zsh', '.ksh', '.fish',
+  '.py', '.pyw', '.rb', '.pl', '.lua', '.php',
+  '.jar', // executes via the registered Java runtime
+])
+
+/**
  * Validate and normalize a launch request. Throws `UNSAFE_APP` (DENY) when the
  * application is blocked, contains path traversal, or carries control chars.
  */
@@ -70,6 +92,10 @@ export function checkLaunchApp(app: unknown, args: readonly unknown[] = []): App
   const stem = base.replace(/\.(exe|app|cmd|bat|com)$/, '')
   if (BLOCKED_LAUNCH_NAMES.has(base) || BLOCKED_LAUNCH_NAMES.has(stem)) {
     throw new ComputerUseError('UNSAFE_APP', 'This application is blocked for computer-use launch', 'DENY')
+  }
+  const dot = base.lastIndexOf('.')
+  if (dot > 0 && BLOCKED_LAUNCH_EXTENSIONS.has(base.slice(dot))) {
+    throw new ComputerUseError('UNSAFE_APP', 'Script, shortcut and installer files cannot be launched by computer-use', 'DENY')
   }
 
   const launchArgs = (args ?? []).map(String)
