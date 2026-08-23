@@ -1,64 +1,125 @@
 # dsh-computer-use
 
-[![CI](https://github.com/xueLan-io/dsh-computer-use/actions/workflows/ci.yml/badge.svg)](https://github.com/xueLan-io/dsh-computer-use/actions/workflows/ci.yml)
+[![CI](https://github.com/was11121/dsh-computer-use/actions/workflows/ci.yml/badge.svg)](https://github.com/was11121/dsh-computer-use/actions/workflows/ci.yml)
 
-DSH 的桌面控制插件仓库：让 DSH Agent 观察（截图 + UI Automation）并操作（鼠标 / 键盘 / 启动应用）Windows 桌面。插件为纯 Node.js 原生运行时（Node-API 直调 Win32 / UIA），**无 Python、无 pip、无外部 sidecar**。
+DSH 的桌面控制插件仓库。插件向 DSH Agent 提供 `computer_*` 工具，用于观察和操作 Windows 桌面，包括枚举窗口、截图、读取 UI Automation 树，以及执行点击、输入、按键、滚动、拖动和应用启动。
 
-> **当前仅 Windows 10/11 x64 是可发布平台。** macOS 与 Linux provider 属于未发布草案（CI 仅做非致命构建冒烟），不要在生产环境视为已支持。
+插件运行时完全基于 Node.js。Windows native 层通过 Node-API 直接调用 Win32 与 UI Automation，不依赖 Python、pip 或外部 sidecar 进程。
 
-## 仓库结构
+## 平台状态
 
-```
-.
-├── .github/workflows/ci.yml   # 四平台 CI（见下）
-├── AGENTS.md                  # 仓库结构约定（源码在哪、什么不要改）
-└── dsh-computer-use/          # 插件本体（独立 npm 包）
-    ├── src/                   # TypeScript 源码（测试跑这里）
-    ├── lib/                   # 构建产物（运行时加载这里；由 src/ 编译）
-    ├── native/                # Windows C++ addon（provider.cc + 预编译 .node）
-    ├── src/providers/         # windows / macos(draft) / linux(draft) provider
-    ├── client/                # DSH web 客户端半体（授权气泡面板）
-    ├── packages/              # 未来分平台发布包占位（未发布）
-    ├── tests/contracts/       # 契约测试（node:test，101 个用例）
-    └── docs/                  # 跨平台计划、native 安全审计记录
-```
+当前只有 Windows 10/11 x64 具备完整的实现、构建和本地运行路径。
 
-插件的使用说明、配置项与完整安全模型见 **[`dsh-computer-use/README.md`](dsh-computer-use/README.md)**。
-
-## CI 矩阵
-
-| Job | 平台 | 内容 |
+| 平台 | 当前状态 | 说明 |
 |---|---|---|
-| `core` | Ubuntu | 类型检查 + 契约测试（`--ignore-scripts`） |
-| `windows` | Windows | 完整构建（含 native addon）+ 契约测试 + `npm pack --dry-run` |
-| `macos` | macOS | 类型检查 + 契约测试；native addon 为 draft，构建非致命（`continue-on-error`） |
-| `linux` | Ubuntu | X11 helper 构建（`make`）+ Xvfb 端到端冒烟 |
+| Windows 10/11 x64 | 当前实现 | `dsh-computer-use` 的主要目标平台；包含 Windows native addon。 |
+| macOS | 未发布草案 | 有 provider 与 native 源码骨架，尚未完成真实 macOS 编译、运行和端到端验证。 |
+| Linux X11 | 未发布草案 | 有 X11 helper 与 provider；辅助功能树、剪贴板等能力仍未完成，不能当作发行版支持。 |
+| Linux Wayland | 受限骨架 | 当前仅保留受限能力，不能视为完整桌面控制支持。 |
 
-## 快速开始
+CI 中的 macOS 构建仍是非致命草案检查，Linux CI 的 X11 烟测也不等于已经发布 Linux 包。平台支持状态以真实目标平台验证和发布包为准。
+
+## 架构
+
+```text
+DSH 模型
+  │  调用 computer_* 工具
+  ▼
+dsh-computer-use（Node/Cordis 插件）
+  │  授权门 / 逐次审批 / 能力检查 / observation 校验
+  ▼
+Windows provider（Node-API native addon）
+  │  Win32 / UI Automation
+  ▼
+窗口 / 鼠标 / 键盘 / 剪贴板
+```
+
+仓库当前保留跨平台 provider 的实验性抽象，但 Windows 是唯一应按可用产品路径安装和验证的平台。
+
+## 快速验证
 
 ```bash
 cd dsh-computer-use
 npm install
-npm run typecheck        # TS 类型检查
-npm run build            # src/ -> lib/ + 同步 client
-npm test                 # 契约测试
-npm run test:native      # native addon 加载冒烟
+npm run typecheck
+npm run build
+npm run verify:build
+npm test
+npm run test:native
 ```
 
-**构建纪律**：测试跑 `src/`，运行时加载 `lib/`。改动 `src/` 后必须 `npm run build` 并一起提交 `lib/`；CI 用 `npm run verify:build` 校验两者一致（2026-08 审计曾发现一整批安全修复停留在 src 未构建、运行时从未生效）。
+测试读取 `src/`，运行时加载 `lib/`。修改 `src/` 后必须执行 `npm run build`，并检查生成的 `lib/` 与 `client/` 是否一并更新。`npm run verify:build` 用于防止运行时产物落后于源码。
 
-安装到 DSH profile、配置项、与视觉模型配合的工作流，见插件 README 的[安装](dsh-computer-use/README.md#安装dsh-web-profile)与[配置](dsh-computer-use/README.md#配置)章节。
+## 安装到 DSH
 
-## 安全
+本仓库的 npm 包位于 `dsh-computer-use/` 子目录。将仓库克隆到本地后，把这个子目录链接到 DSH web profile 的插件目录。
 
-本仓库在 2026-08 经过三轮安全审计，修复均已落地并带回归测试（审批上下文跨会话隔离、随机窗口 generation 令牌防 HWND 复用、启动黑名单含 LOLBIN 与 8.3 短名、剪贴板快照上限与清理、危险 native 导出删除、光标替换崩溃恢复等）。
+1. 在 profile 的 `package.json` 中添加本地依赖，路径替换为插件目录的绝对路径：
 
-分层的防护模型（授权门 / 逐次审批 / observation 熔断 / 输入边界 / 防自操作）见插件 README 的[安全模型](dsh-computer-use/README.md#安全模型)；**如实记录的已知限制**（回环 RPC 信任 web realm、两步输入非原子等）见[已知限制](dsh-computer-use/README.md#已知限制如实记录)，native 层审计详情见 [`dsh-computer-use/docs/NATIVE_SECURITY_NOTES.md`](dsh-computer-use/docs/NATIVE_SECURITY_NOTES.md)。
+   ```json
+   {
+     "dependencies": {
+       "dsh-computer-use": "link:<插件目录的绝对路径>"
+     }
+   }
+   ```
 
-## 分支
+2. 在同一 profile 配置的 `dsh.profile.bundles` 中加入 `"dsh-computer-use"`。
+3. 在 profile 目录下执行：
 
-- `feat/node-native-rewrite` — 活跃开发分支（Node 原生重写 + 2026-08 安全审计修复）
+   ```bash
+   dsh plugin --profile web install
+   ```
 
-## License
+4. 重启 DSH，并确认授权气泡处于关闭状态后再开始测试。
 
-BSD-3-Clause
+插件的完整配置、视觉模型协作流程和安全限制见 [`dsh-computer-use/README.md`](dsh-computer-use/README.md)。
+
+## 安全概要
+
+- `allowControl` 默认关闭；交互动作默认逐次请求用户确认，缺少审批上下文时按拒绝处理。
+- 动作绑定有时效的 `observationId`，执行前会复核窗口身份、随机 generation 令牌和 UI 树状态。
+- Windows/Meta 修饰键与系统组合键被拒绝；鼠标坐标必须落在目标窗口范围内。
+- 应用启动经过黑名单检查，拒绝 shell、脚本宿主、解释器、常见执行包装器、危险扩展名和路径穿越。
+- 插件禁止操作 DSH 自身窗口；截图只渲染目标窗口；截图目录和剪贴板快照都有隔离与清理约束。
+
+这些措施不等同于宿主级安全隔离。回环 RPC 信任整个 DSH web realm、两步全局输入存在非原子间隙等限制，见插件 README 与 [`dsh-computer-use/docs/NATIVE_SECURITY_NOTES.md`](dsh-computer-use/docs/NATIVE_SECURITY_NOTES.md)。
+
+## CI
+
+`.github/workflows/ci.yml` 当前定义四个 job：
+
+- `core`（Ubuntu）：类型检查与契约测试。
+- `windows`（Windows）：安装、构建、契约测试和 `npm pack --dry-run`。
+- `macos`（macOS）：类型检查与契约测试，native addon 构建仍为非致命草案检查。
+- `linux`（Ubuntu）：X11 helper 编译与 Xvfb JSON-lines 烟测。
+
+CI 通过不代表 macOS/Linux 已达到发布条件。
+
+## 仓库结构
+
+```text
+.
+├── .github/workflows/ci.yml   # CI（core / windows / macos / linux）
+├── AGENTS.md                  # 仓库协作约定
+├── scripts/                   # 仓库级辅助脚本
+└── dsh-computer-use/          # 插件本体（独立 npm 包）
+    ├── src/                   # TypeScript 源码
+    ├── lib/                   # 构建产物，运行时加载
+    ├── native/                # Windows C++ addon
+    ├── client/                # DSH web 客户端授权面板
+    ├── tests/contracts/       # 跨平台契约测试
+    ├── packages/              # 未来分包占位，未发布
+    └── docs/                  # 安全审计与跨平台文档
+```
+
+## 文档导航
+
+- [`dsh-computer-use/README.md`](dsh-computer-use/README.md)：安装、配置、工具、视觉模型工作流、安全模型和已知限制。
+- [`dsh-computer-use/docs/NATIVE_SECURITY_NOTES.md`](dsh-computer-use/docs/NATIVE_SECURITY_NOTES.md)：native 层审计记录。
+- [`dsh-computer-use/docs/DEV_CROSS_PLATFORM.md`](dsh-computer-use/docs/DEV_CROSS_PLATFORM.md)：没有实机时的开发与验证策略。
+- [`dsh-computer-use/docs/CROSS_PLATFORM_PLAN.md`](dsh-computer-use/docs/CROSS_PLATFORM_PLAN.md)：跨平台目标、阶段和发布门禁。
+
+## 许可证
+
+插件目录中的 [`dsh-computer-use/LICENSE`](dsh-computer-use/LICENSE) 是 BSD 3-Clause License。版权声明和许可证条件以该文件为准；使用、修改或分发时请保留原始声明，并同时遵守第三方依赖各自的授权条款。
