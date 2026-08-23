@@ -1,145 +1,160 @@
 # dsh-computer-use
 
-## 平台支持状态
+DSH 的 Windows 桌面控制插件。它向 DSH Agent 提供窗口观察、截图、UI Automation 观察以及鼠标、键盘和应用启动工具。
 
-> **当前仅 Windows 10/11 x64 是可发布平台。**
-> macOS 与 Linux 的 `DesktopProvider`、原生 helper/addon 属于**未发布草案**，尚未在目标平台编译、运行验证，也没有对应的可安装发布包。不要在生产环境中把 macOS/Linux 视为"已支持"。
+## 当前状态
 
-DSH 桌面控制插件：让 DSH Agent 操作 Windows 桌面。插件是 Node.js 原生运行时（Node-API 直调 Win32 / UI Automation），不需要 Python、pip 或外部 sidecar。
+| 平台 | 状态 |
+|---|---|
+| Windows 10/11 x64 | 当前唯一按可用路径维护的平台 |
+| macOS | 未发布草案，尚未完成目标平台验证 |
+| Linux X11 | 未发布草案，能力不完整且尚未作为安装包发布 |
+| Linux Wayland | 受限兼容骨架，不提供完整桌面控制 |
 
-架构复刻自 Codex Computer Use：
+macOS/Linux 的 provider、helper 和 native addon 源码不能代表已经支持对应平台。不要在生产环境中把这些目录或 `packages/` 下的占位包当作可安装发行版。
 
+## 工作方式
+
+```text
+DSH Agent
+  │ computer_* 工具
+  ▼
+插件 core：授权 / 审批 / observation / 能力检查
+  │
+  ▼
+Windows provider：Node-API → Win32 / UI Automation
 ```
-DSH 模型
-  ↓ 调用 computer_* 工具
-dsh-computer-use (Node/Cordis)
-  ↓ Node native runtime
-dsh-computer-use-native + Win32/UI Automation
-  Windows 窗口 / 鼠标 / 键盘
-```
 
-首次安装若没有预编译二进制（Prebuild），需要 Windows C++ 生成工具链（Visual Studio Build Tools / MSVC + node-gyp）。
+插件不依赖 Python、pip 或外部 sidecar。没有匹配的预编译 native 二进制时，Windows 安装需要 Visual Studio Build Tools、MSVC 和 node-gyp。
 
 ## 工具
 
-- `computer_list_apps`：列出可操作的窗口
-- `computer_get_window_state`：截图（保存为 DSH 附件）+ 可选 Windows UI Automation 观察快照
-- `computer_activate_window`：激活窗口（需通过交互审批）
-- `computer_click`：使用最新 observation 的窗口相对坐标点击
-- `computer_type_text`：向目标窗口输入文本（优先剪贴板粘贴；粘贴不可用时回退 Unicode 注入，单次至多 1000 字符）
-- `computer_press_key`：发送不包含 Windows/Meta 键的组合键
-- `computer_scroll`：使用真实 Windows wheel input 滚动
-- `computer_drag`：拖动
-- `computer_launch_app`：启动应用（统一审批门禁 + 启动黑名单）
+- `computer_list_apps`：列出当前可操作的窗口。
+- `computer_get_window_state`：获取目标窗口截图，并可返回 UI Automation 观察快照、`screenshotPath` 和 `observationId`。
+- `computer_activate_window`：激活目标窗口，需要交互审批。
+- `computer_click`：按最近一次 observation 的窗口相对坐标点击，也可使用观察中的元素引用。
+- `computer_type_text`：输入文本，优先通过会话隔离的剪贴板粘贴，失败时回退 Unicode 注入；SendInput 回退路径单次最多 1000 个字符。
+- `computer_press_key`：发送白名单内的组合键；Windows/Meta 修饰键和系统组合键不允许使用。
+- `computer_scroll`：发送真实 Windows 滚轮输入。
+- `computer_drag`：在目标窗口内拖动。
+- `computer_launch_app`：启动应用，经过审批门禁和启动黑名单检查。
 
-控制期间屏幕四周显示蓝色高亮边框与顶部提示条，鼠标指针切换为蓝色 DSH 光标（截图时临时隐藏，避免干扰视觉模型）。引擎异常退出后，下次加载会自动恢复被替换的系统光标。
-
-授权气泡：DSH 聊天输入框上方的小气泡，打勾前插件**无权**控制电脑。开关经插件自己的 `/computer-use` 回环 RPC 通道读写（带限速与审计日志），不依赖宿主设置白名单。
+控制期间可能显示目标窗口边框、顶部提示和 DSH 指针。截图时指针会暂时隐藏，避免干扰视觉模型；引擎异常退出后，下一次加载会尝试恢复系统指针。
 
 ## 依赖
 
 - Windows 10/11 x64
-- Node.js 22.19+
+- Node.js 22.19 或更高版本
 - `dsh-computer-use-native` Windows x64 Node-API provider
 
-UIA 树有节点数和深度边界；截断时会标记 `uiaTruncated`，不会伪造完整树。
+## 安装到 DSH web profile
 
-## 安装（DSH web profile）
+本目录就是插件包根目录。将它克隆或链接到本地插件目录，然后在 DSH web profile 中声明链接依赖。
 
-1. 把本插件仓库克隆或链接到本地插件目录（例如 `~/.dsh/plugins/dsh-computer-use`）。
-2. 在 DSH profile 的 `package.json`（例如 `~/.dsh/profiles/web/package.json`）的 `dependencies` 中添加：
+1. 在 profile 的 `package.json` 的 `dependencies` 中加入：
 
    ```json
-   "dsh-computer-use": "link:C:/Users/<用户名>/.dsh/plugins/dsh-computer-use"
+   "dsh-computer-use": "link:C:/path/to/dsh-computer-use"
    ```
 
-3. 在同一个文件的 `dsh.profile.bundles` 中添加 `"dsh-computer-use"`。
-4. 在 `~/.dsh/profiles/web` 目录下执行插件安装与构建：
+2. 在同一 profile 配置的 `dsh.profile.bundles` 中加入 `"dsh-computer-use"`。
+3. 在 profile 目录执行：
 
    ```bash
    dsh plugin --profile web install
    ```
 
-5. 重启 DSH。
+4. 重启 DSH。首次安装若需要本地编译 native addon，请先准备 MSVC 生成工具链。
 
 ## 配置
 
 ```yaml
-# ~/.dsh/settings.yaml (或 DSH 配置目录下的 settings.yaml)
 computer-use:
   enabled: true
-  allowControl: false      # 授权开关（默认关闭！气泡打勾后才允许控制）
-  requireApproval: true    # 交互动作（点击/输入/按键/启动/激活）先征求用户同意
-  skipApprovalWhenPolicyNever: true  # 会话策略为"不再询问"(never) 时跳过交互审批，仅由 allowControl 把关；
-                                     # 设为 false 则遵循官方 fail-closed 语义（此类操作会被拒绝）
-  screenshotDir: computer-use/screenshots   # 仅允许 DSH home 下的相对路径（realpath 校验）
-  screenshotRetention: 86400000             # 截图保留时长；<=0 表示永不清理
-  overlayEnabled: true     # 控制时显示蓝色高亮 + 顶部提示 + 自定义鼠标
-  overlayIdleMs: 10000     # 最后一次操作后多久自动隐藏指示
+  allowControl: false
+  requireApproval: true
+  skipApprovalWhenPolicyNever: true
+  screenshotDir: computer-use/screenshots
+  screenshotRetention: 86400000
+  overlayEnabled: true
+  overlayIdleMs: 10000
   overlayText: DSH 正在控制你的电脑
 ```
 
-> `overlayColor` 已废弃：指示颜色固定为 DSH 品牌蓝，该项仅为旧配置兼容保留。
+配置说明：
 
-## 配合视觉模型
+- `allowControl` 默认关闭。用户通过授权气泡明确开启后，插件才允许执行桌面控制动作。
+- `requireApproval` 控制点击、输入、按键、启动和激活等交互动作是否逐次请求确认。
+- `skipApprovalWhenPolicyNever` 为 `true` 时，会话策略为 `never` 可跳过逐次审批，但不能绕过 `allowControl`；设为 `false` 时按 fail-closed 语义拒绝此类调用。
+- `screenshotDir` 只能使用 DSH home 下的相对路径，路径会经过 realpath containment 校验。
+- `screenshotRetention` 的单位是毫秒；小于等于 0 表示不自动清理。
+- `overlayColor` 已废弃，指示颜色固定为 DSH 品牌蓝，仅保留旧配置兼容。
 
-主模型（如 DeepSeek）不能看图时，让 Agent：
+## 与视觉模型配合
 
-1. `computer_list_apps` 选窗口
-2. `computer_get_window_state` 截图和 UIA 快照（返回图片附件、`screenshotPath`、`observationId`）
-3. `vision_analyze`（来自 `dsh-vision-model`）传 `imagePath=screenshotPath` 分析截图
-4. 根据分析结果调用动作工具，并传入同一次观察返回的 `observationId`
-5. 每次动作后**必须**重新 `computer_get_window_state` 刷新（元素索引和坐标只对当次有效）
+当主模型不能直接查看图片时，推荐按以下顺序操作：
+
+1. 用 `computer_list_apps` 选择目标窗口。
+2. 用 `computer_get_window_state` 获取截图和 observation，并记录返回的 `observationId`。
+3. 将 `screenshotPath` 交给 `vision_analyze` 等视觉工具分析。
+4. 根据分析结果调用动作工具，并传入同一次 observation 的 `observationId`。
+5. 每个动作完成后重新获取窗口状态；元素索引、坐标和 UI 树只对对应 observation 有效。
 
 ## 安全模型
 
-插件按纵深分层设防（2026-08 三轮安全审计后落地）：
+### 授权与审批
 
-**授权与审批**
-- `allowControl` 默认关闭，需在界面显式授权；每次翻转带限速（300ms）与审计日志，并立即销毁进行中的控制会话。
-- `requireApproval: true` 时，点击、输入、按键、启动、激活窗口均请求用户逐次确认；无审批上下文的调用 fail-closed 拒绝。
-- 审批请求与 observation 归属按调用链隔离（AsyncLocalStorage）：并发会话无法把 A 会话的动作挂在 B 会话的审批卡片下。
+- `allowControl` 默认关闭；切换授权带有限速与审计记录，并会清理正在进行的控制会话。
+- 交互动作在 `requireApproval: true` 时逐次请求用户确认；没有有效审批上下文时按拒绝处理。
+- 审批上下文按调用链隔离，并发会话不能把一个会话的动作挂到另一个会话的审批卡片下。
 
-**观察熔断（TOCTOU 防线）**
-- 所有动作绑定 3 分钟有效期的 `observationId`，且校验会话/agent 归属，跨会话重放直接拒绝。
-- 动作执行前重新校验窗口身份（PID、进程路径、类名、矩形），并以**随机 64 位窗口 generation 令牌**复核 HWND 未被复用。
-- 目标窗口变化、UIA 树 checksum 不一致时自动熔断，要求重新观察。
+### observation 熔断
 
-**输入边界**
-- 永不发送 Windows/Meta 修饰键及系统组合键（Alt+Tab、Ctrl+Alt+Del 等）；键码经白名单映射。
-- 点击/滚动/拖动坐标校验在目标窗口矩形内，越界直接报错。
-- 前台激活失败时回退到后台安全的 UIA invoke / PostMessage，绝不向错误窗口注入全局输入。
+- 每个动作都绑定有时效的 `observationId`，并校验 session、agent 和目标窗口归属；跨会话重放会被拒绝。
+- 执行动作前会复核 PID、进程路径、窗口类名、矩形和随机 generation 令牌，防止 HWND 被复用后继续操作旧目标。
+- 目标窗口身份或 UI Automation checksum 发生变化时，动作会失败并要求重新观察。
+- UI Automation 树有节点数和深度上限；截断时明确标记 `uiaTruncated`，不会伪造完整树。
 
-**启动黑名单**
-- 拒绝 shell、脚本宿主、解释器（含版本化名称）、执行包装器（`env`/`nohup`/`wsl`/`schtasks` 等 LOLBIN）、脚本与快捷方式扩展名（`.bat`/`.lnk`/`.desktop` 等）、NTFS 8.3 短名、控制字符与路径穿越。
+### 输入与启动边界
 
-**防自操作与隔离**
-- 硬性禁止对 DSH 自身窗口操作（进程路径、类名、品牌标题、句柄记忆四重识别，不可关闭）。
-- 截图仅渲染目标窗口自身（PrintWindow），不泄露被遮挡的其他窗口；截图目录被约束在 DSH home 内（realpath 防符号链接逃逸），过期自动清理。
-- 剪贴板快照按会话隔离、数量与清理受控；恢复失败时擦除剪贴板，防止敏感输入残留。
+- 不发送 Windows/Meta 修饰键和系统级组合键，例如 Alt+Tab、Ctrl+Alt+Del。
+- 点击、滚动和拖动坐标必须位于目标窗口矩形内；前台激活失败时不会向未知窗口注入全局输入。
+- 应用启动拒绝 shell、脚本宿主、解释器、执行包装器（如 `env`、`nohup`、`wsl`、`schtasks`）、脚本和快捷方式扩展名、NTFS 8.3 短名、控制字符与路径穿越。
 
-## 已知限制（如实记录）
+### 防自操作与数据清理
 
-- **回环 RPC 信任整个 DSH web realm**：同一 DSH 窗口内的任何脚本（包括其他客户端插件）理论上都能翻转 `allowControl` 开关（有限速与日志，无身份校验）。彻底修复需要宿主级隔离。
-- **两步全局输入非原子**：`moveCursor→click`、`activate→type` 之间的微秒级间隙理论上可被物理操作重定向单次输入；每条输入路径在注入前均重新校验激活状态。
-- **X11 helper（未发布）默认经 PATH 解析**二进制名；环境变量覆盖必须绝对路径。Linux 包发布前需在 Linux 上重新编译 helper（`make -C src/providers/linux/x11`）。
-- 截断的 UIA 树只校验截断边界内的变化（部分树校验的固有限制）。
+- 通过进程路径、类名、品牌标题和句柄状态识别并禁止操作 DSH 自身窗口。
+- 截图只渲染目标窗口自身，不提供全桌面截图；截图路径限制在 DSH home 内并按配置清理。
+- 剪贴板快照按 session/agent 隔离并设数量上限；恢复失败时清理剪贴板，减少敏感输入残留。
 
-详见 `docs/NATIVE_SECURITY_NOTES.md`（native 层审计记录与已接受残余风险清单）。
+## 已知限制
 
-## 开发
+这些限制是当前设计的一部分，不应被安装说明或安全概要隐藏：
+
+- 回环 RPC 信任整个 DSH web realm。同一 DSH 窗口内的其他脚本理论上可能影响 `allowControl`；彻底修复需要宿主级隔离。
+- `moveCursor` 后点击、激活后输入等路径不是原子操作。物理用户或其他软件可能在两个 native 调用之间改变焦点；执行前虽会再次校验，无法消除全部竞态。
+- X11 helper 默认按 PATH 查找。`DSH_COMPUTER_USE_X11_HELPER` 覆盖值必须是绝对路径，Linux 发布前还必须在目标 Linux 环境重新编译 helper。
+- 截断 UI Automation 树只能校验已返回的部分树，不能证明未返回的节点没有变化。
+- macOS/Linux 尚未达到发布门槛，不能依据 provider 的源码骨架推断完整能力或兼容性。
+
+native 层审计记录见 [`docs/NATIVE_SECURITY_NOTES.md`](docs/NATIVE_SECURITY_NOTES.md)。
+
+## 开发与验证
 
 ```bash
 npm install
-npm run typecheck       # TS 类型检查
-npm run build           # 编译 src/ -> lib/ 并同步 client
-npm run verify:build    # CI 用：确认 lib/ 与 src/ 一致（防止构建产物落后于源码）
-npm test                # 契约测试（tests/contracts）
-npm run test:native     # native addon 加载冒烟
+npm run typecheck
+npm run build
+npm run verify:build
+npm run test:contract
+npm run test:native
+node scripts/package-check.mjs
 ```
 
-改动 `src/` 后必须 `npm run build` 并提交 `lib/`——运行时加载 `lib/`，测试跑 `src/`，两者不一致时测试通过不代表运行正确。
+`src/` 是 TypeScript 源码，`lib/` 是运行时加载的构建产物，`client/` 由构建脚本同步。修改 `src/` 后必须重新执行 `npm run build`；只看到源码测试通过，不代表运行时产物已经更新。
 
-## License
+跨平台验证策略见 [`docs/DEV_CROSS_PLATFORM.md`](docs/DEV_CROSS_PLATFORM.md)，目标和发布门禁见 [`docs/CROSS_PLATFORM_PLAN.md`](docs/CROSS_PLATFORM_PLAN.md)。
 
-BSD-3-Clause
+## 许可证
+
+本插件目录包含 [`LICENSE`](LICENSE)，内容为 BSD 3-Clause License。使用、修改或分发时请以该文件中的版权声明和条件为准，并遵守第三方依赖各自的授权条款。
