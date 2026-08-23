@@ -206,6 +206,21 @@ test('createProvider resolves the current platform lazily', async () => {
   if (process.platform === 'win32') assert.equal(info.provider, 'windows')
 })
 
+test('WindowsProvider.pressKey rejects full-screen capture keys before any input', async () => {
+  // PrintScreen copies the entire multi-monitor desktop into the shared
+  // clipboard; rejecting it keeps the plugin's window-isolated capture promise.
+  if (process.platform !== 'win32') return
+  const { WindowsProvider } = await import('../../src/providers/windows/provider.ts')
+  const provider = new WindowsProvider()
+  for (const key of ['printscreen', 'PrintScreen', 'alt+printscreen', 'ctrl+printscreen']) {
+    await assert.rejects(
+      () => provider.pressKey({ windowId: 'win:hWnd:0000000000000001', key }),
+      (e: unknown) => e instanceof ComputerUseError && e.code === 'FORBIDDEN_KEY',
+      `expected ${key} to be forbidden`,
+    )
+  }
+})
+
 // ---------------------------------------------------------------------------
 // X11 helper trust boundary (rejection happens before any spawn)
 // ---------------------------------------------------------------------------

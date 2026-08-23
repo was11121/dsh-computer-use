@@ -61,6 +61,17 @@ static void window_id_to_string(char *buf, size_t len, Window w) {
   snprintf(buf, len, "x11:xid:0x%08lx", (unsigned long)w);
 }
 
+/* X11 properties with format 32 carry 32-bit units even on 64-bit builds.
+ * Dereferencing the returned buffer as `Window *` / `unsigned long *` both
+ * reads past the allocation and mis-parses ids on LP64, so every 32-bit unit
+ * is decoded explicitly. The caller guarantees index < nitems. */
+static unsigned long card32_at(const unsigned char *data, unsigned long index) {
+  return (unsigned long)data[index * 4]
+       | ((unsigned long)data[index * 4 + 1] << 8)
+       | ((unsigned long)data[index * 4 + 2] << 16)
+       | ((unsigned long)data[index * 4 + 3] << 24);
+}
+
 static int parse_window_id(const char *id, Window *out) {
   if (strncmp(id, "x11:xid:0x", 10) != 0) return 0;
   char *end = NULL;
@@ -111,8 +122,8 @@ static pid_t get_window_pid(Window w) {
   unsigned char *data = NULL;
   pid_t pid = 0;
   if (XGetWindowProperty(dpy, w, pid_atom, 0, 1, False, XA_CARDINAL,
-                         &type, &format, &nitems, &bytes_after, &data) == Success && data && nitems > 0) {
-    pid = (pid_t)(*((unsigned long *)data));
+                         &type, &format, &nitems, &bytes_after, &data) == Success && data && nitems > 0 && format == 32) {
+    pid = (pid_t)card32_at(data, 0);
     XFree(data);
   }
   return pid;
@@ -172,13 +183,12 @@ static void method_list_windows(FILE *out) {
   Window root = DefaultRootWindow(dpy);
   fputs("{\"ok\":true,\"value\":[", out);
   if (XGetWindowProperty(dpy, root, net_cl, 0, 4096, False, XA_WINDOW,
-                         &type, &format, &nitems, &bytes_after, &data) == Success && data) {
-    Window *windows = (Window *)data;
+                         &type, &format, &nitems, &bytes_after, &data) == Success && data && format == 32) {
     int first = 1;
     for (unsigned long i = 0; i < nitems; i++) {
       // Windows that cannot be queried (gone / unmapped under the WM) are
       // skipped rather than emitted with garbage geometry.
-      emit_window_json(out, windows[i], &first);
+      emit_window_json(out, (Window)card32_at(data, i), &first);
     }
     XFree(data);
   }
@@ -359,8 +369,8 @@ static void method_activate_window(FILE *out, const char *wid) {
     unsigned long nitems = 0, bytes_after = 0;
     unsigned char *data = NULL;
     if (XGetWindowProperty(dpy, DefaultRootWindow(dpy), active, 0, 1, False, XA_WINDOW,
-                           &type, &format, &nitems, &bytes_after, &data) == Success && data && nitems > 0) {
-      if (*((Window *)data) == w) verified = 1;
+                           &type, &format, &nitems, &bytes_after, &data) == Success && data && nitems > 0 && format == 32) {
+      if ((Window)card32_at(data, 0) == w) verified = 1;
       XFree(data);
     }
   }
@@ -474,16 +484,60 @@ static const char *BLOCKED_META_NAMES[] = {
   "lwin", "rwin", "leftwindows", "rightwindows",
 };
 
+/* Lowercase into a bounded buffer; tokens longer than cap-1 are truncated,
+ * which only makes them miss the blocklists below (fail toward the strict
+ * name lookup, never toward a bypass). */
+static void lower_copy(char *dst, size_t cap, const char *src) {
+  size_t i = 0;
+  for (; src[i] && i + 1 < cap; i++) {
+    char c = src[i];
+    dst[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  }
+  dst[i] = '\0';
+}
+
 static int is_meta_name(const char *name) {
   char lower[32];
-  size_t i = 0;
-  for (; name[i] && i + 1 < sizeof(lower); i++) {
-    char c = name[i];
-    lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-  }
-  lower[i] = '\0';
+  lower_copy(lower, sizeof(lower), name);
   for (size_t k = 0; k < sizeof(BLOCKED_META_NAMES) / sizeof(BLOCKED_META_NAMES[0]); k++) {
     if (strcmp(lower, BLOCKED_META_NAMES[k]) == 0) return 1;
+  }
+  return 0;
+}
+
+/* System-level chords that must never be sent: they switch apps, close
+ * windows, open a terminal or the session manager and escape the controlled
+ * session. Mirrors the forbidden-chord lists in the Node runtime and the
+ * Windows provider: the last token is the main key; the chord fires when all
+ * of its modifiers appear among the earlier tokens (extra modifiers still
+ * count, same semantics as the JS side). */
+static const struct {
+  const char *mods[3]; /* NULL-terminated, at most 2 modifiers */
+  const char *key;
+} BLOCKED_CHORDS[] = {
+  {{"alt", NULL, NULL}, "tab"},
+  {{"alt", NULL, NULL}, "f4"},
+  {{"alt", NULL, NULL}, "esc"},
+  {{"alt", NULL, NULL}, "space"},
+  {{"ctrl", NULL, NULL}, "esc"},
+  {{"ctrl", "shift", NULL}, "esc"},
+  {{"ctrl", "alt", NULL}, "delete"},
+  {{"ctrl", "alt", NULL}, "t"},
+};
+
+static int is_forbidden_chord(char lower[][32], int n) {
+  const char *main = lower[n - 1];
+  for (size_t c = 0; c < sizeof(BLOCKED_CHORDS) / sizeof(BLOCKED_CHORDS[0]); c++) {
+    if (strcmp(main, BLOCKED_CHORDS[c].key) != 0) continue;
+    int all = 1;
+    for (int m = 0; m < 3 && BLOCKED_CHORDS[c].mods[m]; m++) {
+      int found = 0;
+      for (int i = 0; i < n - 1; i++) {
+        if (strcmp(lower[i], BLOCKED_CHORDS[c].mods[m]) == 0) { found = 1; break; }
+      }
+      if (!found) { all = 0; break; }
+    }
+    if (all) return 1;
   }
   return 0;
 }
@@ -507,25 +561,43 @@ static KeyCode keycode_for_name(const char *name) {
 static void method_press_key(FILE *out, const char *key) {
   char buf[256];
   snprintf(buf, sizeof(buf), "%s", key ? key : "");
-  KeyCode codes[8];
+  char *toks[8];
   int n = 0;
   char *save = NULL;
   char *tok = strtok_r(buf, "+", &save);
-  while (tok && n < 8) {
+  while (tok) {
     while (*tok == ' ') tok++;
     char *end = tok + strlen(tok);
     while (end > tok && end[-1] == ' ') *--end = '\0';
-    KeyCode kc = keycode_for_name(tok);
-    if (!kc) {
-      fprintf(out, "{\"ok\":false,\"code\":\"UNSUPPORTED_KEY\",\"message\":\"unsupported key: %s\",\"recovery\":\"DENY\"}\n", tok);
-      return;
+    if (*tok) {
+      /* Chords longer than the table must fail, not silently drop their tail:
+       * dropping tokens could re-interpret a 9-token string as a shorter one. */
+      if (n >= 8) {
+        fputs("{\"ok\":false,\"code\":\"UNSUPPORTED_KEY\",\"message\":\"too many keys in chord\",\"recovery\":\"DENY\"}\n", out);
+        return;
+      }
+      toks[n++] = tok;
     }
-    codes[n++] = kc;
     tok = strtok_r(NULL, "+", &save);
   }
   if (n == 0) {
     fputs("{\"ok\":false,\"code\":\"UNSUPPORTED_KEY\",\"message\":\"empty key\",\"recovery\":\"DENY\"}\n", out);
     return;
+  }
+  char lower[8][32];
+  for (int i = 0; i < n; i++) lower_copy(lower[i], sizeof(lower[i]), toks[i]);
+  if (is_forbidden_chord(lower, n)) {
+    fputs("{\"ok\":false,\"code\":\"FORBIDDEN_KEY\",\"message\":\"system shortcut combinations are not allowed\",\"recovery\":\"DENY\"}\n", out);
+    return;
+  }
+  KeyCode codes[8];
+  for (int i = 0; i < n; i++) {
+    KeyCode kc = keycode_for_name(toks[i]);
+    if (!kc) {
+      fprintf(out, "{\"ok\":false,\"code\":\"UNSUPPORTED_KEY\",\"message\":\"unsupported key: %s\",\"recovery\":\"DENY\"}\n", toks[i]);
+      return;
+    }
+    codes[i] = kc;
   }
   for (int i = 0; i < n; i++) XTestFakeKeyEvent(dpy, codes[i], True, CurrentTime);
   for (int i = n - 1; i >= 0; i--) XTestFakeKeyEvent(dpy, codes[i], False, CurrentTime);
@@ -646,6 +718,11 @@ static const char *json_field(const char *line, const char *name, char *value, s
                 else { hex_ok = 0; break; }
               }
               if (hex_ok && cp) {
+                /* One \u escape can expand to 3 UTF-8 bytes; the loop guard
+                 * only guarantees room for one. Check the full expansion plus
+                 * the trailing NUL up front and fail closed otherwise. */
+                size_t need = (cp < 0x80) ? 1 : (cp < 0x800) ? 2 : 3;
+                if (i + need >= cap) return NULL;
                 if (cp < 0x80) value[i++] = (char)cp;
                 else if (cp < 0x800) {
                   value[i++] = (char)(0xC0 | (cp >> 6));

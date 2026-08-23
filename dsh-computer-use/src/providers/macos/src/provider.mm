@@ -14,6 +14,8 @@
 #import <napi.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cerrno>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -58,9 +60,22 @@ static CGWindowID ParseWindowId(const std::string &id, pid_t *pidOut) {
   if (id.rfind(prefix, 0) != 0) return 0;
   size_t a = prefix.size();
   size_t b = id.find(':', a);
-  if (b == std::string::npos) return 0;
-  *pidOut = (pid_t)std::stoi(id.substr(a, b - a));
-  return (CGWindowID)std::stoul(id.substr(b + 1));
+  if (b == std::string::npos || b == a) return 0;
+  std::string pidStr = id.substr(a, b - a);
+  std::string widStr = id.substr(b + 1);
+  if (pidStr.empty() || widStr.empty()) return 0;
+  // std::stoi/std::stoul throw on malformed ids and an uncaught C++ exception
+  // aborts the whole Node process; parse with strtol so junk just fails.
+  errno = 0;
+  char *end = nullptr;
+  long pidV = strtol(pidStr.c_str(), &end, 10);
+  if (errno != 0 || end == pidStr.c_str() || *end != '\0') return 0;
+  errno = 0;
+  end = nullptr;
+  unsigned long widV = strtoul(widStr.c_str(), &end, 10);
+  if (errno != 0 || end == widStr.c_str() || *end != '\0') return 0;
+  *pidOut = (pid_t)pidV;
+  return (CGWindowID)widV;
 }
 
 static NSDictionary *WindowInfo(CGWindowID wid) {
@@ -205,7 +220,7 @@ static AXUIElementRef FindAXWindow(pid_t pid, CGRect bounds) {
         AXValueGetValue((AXValueRef)sizeRef, kAXValueCGSizeType, &size);
         CFRelease(sizeRef);
       }
-      if (CGRectIsNull(bounds)) { match = win; CFRetain(match); break; }
+      if (CGRectIsNull(bounds)) { match = win; break; }
       CGFloat dist = fabs(pos.x - bounds.origin.x) + fabs(pos.y - bounds.origin.y) +
                      fabs(size.width - bounds.size.width) + fabs(size.height - bounds.size.height);
       if (dist < bestDist) { bestDist = dist; match = win; }
@@ -467,8 +482,13 @@ static Napi::Value ElementRect(const Napi::CallbackInfo &info) {
 // Full-format, keyed clipboard snapshots: each NSPasteboardItem is copied with
 // ALL of its declared types (text, images, files, HTML, ...), so restoring
 // never drops formats; snapshots are keyed by session owner so concurrent or
-// cross-session paste flows cannot restore the wrong content.
+// cross-session paste flows cannot restore the wrong content. The map is
+// capped (least-recently-saved eviction) so sessions that die without a
+// restore cannot pin full pasteboard copies forever — same fix the Windows
+// addon received in the 2026-08 audit.
 static NSMutableDictionary<NSString *, NSArray<NSPasteboardItem *> *> *gSavedClipboard = nil;
+static NSMutableArray<NSString *> *gSavedClipboardOrder = nil;
+static const NSUInteger kMaxSavedClipboard = 8;
 
 static NSString *ClipboardKeyFor(const Napi::CallbackInfo &info) {
   if (info.Length() > 0 && info[0].IsString()) {
@@ -477,9 +497,28 @@ static NSString *ClipboardKeyFor(const Napi::CallbackInfo &info) {
   return @"default";
 }
 
+static void EvictSavedClipboardIfFull() {
+  if (!gSavedClipboard || !gSavedClipboardOrder) return;
+  while (gSavedClipboard.count >= kMaxSavedClipboard && gSavedClipboardOrder.count > 0) {
+    NSString *oldest = gSavedClipboardOrder[0];
+    [gSavedClipboard removeObjectForKey:oldest];
+    [gSavedClipboardOrder removeObjectAtIndex:0];
+  }
+}
+
+static void ClearAllSavedClipboard() {
+  [gSavedClipboard removeAllObjects];
+  [gSavedClipboardOrder removeAllObjects];
+}
+
 static Napi::Value SaveClipboard(const Napi::CallbackInfo &info) {
   @autoreleasepool {
     if (!gSavedClipboard) gSavedClipboard = [NSMutableDictionary dictionary];
+    if (!gSavedClipboardOrder) gSavedClipboardOrder = [NSMutableArray array];
+    NSString *key = ClipboardKeyFor(info);
+    [gSavedClipboard removeObjectForKey:key];
+    [gSavedClipboardOrder removeObject:key];
+    EvictSavedClipboardIfFull();
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     NSArray<NSPasteboardItem *> *items = [pb pasteboardItems];
     NSMutableArray<NSPasteboardItem *> *copies = [NSMutableArray arrayWithCapacity:items.count];
@@ -491,7 +530,17 @@ static Napi::Value SaveClipboard(const Napi::CallbackInfo &info) {
       }
       [copies addObject:copy];
     }
-    gSavedClipboard[ClipboardKeyFor(info)] = copies;
+    gSavedClipboard[key] = copies;
+    [gSavedClipboardOrder addObject:key];
+  }
+  return JsBool(info.Env(), true);
+}
+
+// Drop every snapshot without restoring: called on control-session teardown so
+// a dead session cannot leak its captured pasteboard contents.
+static Napi::Value ClearClipboardSnapshots(const Napi::CallbackInfo &info) {
+  @autoreleasepool {
+    ClearAllSavedClipboard();
   }
   return JsBool(info.Env(), true);
 }
@@ -519,13 +568,9 @@ static Napi::Value SetClipboardText(const Napi::CallbackInfo &info) {
   return JsBool(info.Env(), true);
 }
 
-static Napi::Value GetClipboardText(const Napi::CallbackInfo &info) {
-  @autoreleasepool {
-    NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    NSString *s = [pb stringForType:NSPasteboardTypeString];
-    return JsString(info.Env(), NSStr(s));
-  }
-}
+// NOTE: GetClipboardText (read the shared pasteboard) was removed in the
+// 2026-08 audit — nothing used it and it exported the whole shared clipboard
+// to any same-process caller.
 
 static Napi::Value Paste(const Napi::CallbackInfo &info) {
   CGEventRef down = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)9, true);
@@ -593,8 +638,8 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("elementRect", Napi::Function::New(env, ElementRect));
   exports.Set("saveClipboard", Napi::Function::New(env, SaveClipboard));
   exports.Set("restoreClipboard", Napi::Function::New(env, RestoreClipboard));
+  exports.Set("clearClipboardSnapshots", Napi::Function::New(env, ClearClipboardSnapshots));
   exports.Set("setClipboardText", Napi::Function::New(env, SetClipboardText));
-  exports.Set("getClipboardText", Napi::Function::New(env, GetClipboardText));
   exports.Set("paste", Napi::Function::New(env, Paste));
   exports.Set("overlayCreate", Napi::Function::New(env, OverlayCreate));
   exports.Set("overlayShow", Napi::Function::New(env, OverlayShow));

@@ -25,8 +25,6 @@ export const listWindows = native.listWindows
 export const getWindow = native.getWindow
 export const verifyWindow = native.verifyWindow
 export const captureWindow = native.captureWindow
-export const screenRect = native.screenRect
-export const captureScreen = native.captureScreen
 export const activateWindow = native.activateWindow
 export const invokeAtPoint = native.invokeAtPoint
 export const elementClick = native.elementClick
@@ -39,13 +37,17 @@ export const scroll = native.scroll
 export const drag = native.drag
 export const postClick = native.postClick
 export const postWheel = native.postWheel
-export const postChar = native.postChar
+// NOTE: postChar, getClipboardText, screenRect and captureScreen were removed
+// in the 2026-08 audit — they were never used by the provider layer and each
+// exported a capability the plugin never exposes on purpose.
 // Clipboard snapshots are keyed by session owner so concurrent or cross-session
 // paste flows never restore the wrong content.
 export const saveClipboard = (key) => native.saveClipboard(typeof key === 'string' ? key : 'default')
 export const restoreClipboard = (key) => native.restoreClipboard(typeof key === 'string' ? key : 'default')
+// Drop all snapshots without restoring: teardown path so dead sessions cannot
+// pin their captured clipboard IDataObject (bounded leak guard).
+export const clearClipboardSnapshots = () => native.clearClipboardSnapshots()
 export const setClipboardText = native.setClipboardText
-export const getClipboardText = native.getClipboardText
 export const paste = native.paste
 export const accessibilityTree = native.accessibilityTree
 export const overlayCreate = native.overlayCreate

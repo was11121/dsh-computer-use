@@ -62,8 +62,12 @@ async function canonicalScreenshotRoot(config) {
         throw new Error('The screenshot directory resolves outside the DSH home (junction/symlink)');
     return canonical;
 }
+let screenshotSequence = 0;
 async function screenshotPath(config, windowId) {
-    return join(await canonicalScreenshotRoot(config), `window-${windowId}-${Date.now()}.png`);
+    const dir = await canonicalScreenshotRoot(config);
+    // Two captures of the same window can land in the same millisecond; a
+    // monotonic suffix keeps the files (and their attachment records) distinct.
+    return join(dir, `window-${windowId}-${Date.now()}-${screenshotSequence++}.png`);
 }
 /** Delete screenshots older than the retention window (best effort). No
  * symlink/junction targets are ever followed: links and directories are
@@ -121,19 +125,12 @@ function gate(deps) {
     desktop.configureOverlay(config);
 }
 /**
- * Session/agent scope for observation isolation. The exact Agent shape comes
- * from the harness (`@deepseek-ai/dsh-agent`); read defensively so a missing
- * field degrades to a stable "unknown" scope instead of throwing.
+ * Session/agent scope for observation isolation. Delegated to the runtime so
+ * the AsyncLocalStorage call context derives the same scope (see
+ * runWithCallContext); kept here only for the legacy bindExec fallback.
  */
 function sessionScope(exec) {
-    const agent = exec.agent;
-    const session = agent?.session;
-    const sessionValue = session?.sessionId;
-    const sessionId = typeof session?.id === 'string' ? session.id
-        : typeof sessionValue === 'string' ? sessionValue
-            : 'unknown';
-    const agentId = typeof agent?.id === 'string' ? agent.id : 'unknown';
-    return { sessionId: sessionId || 'unknown', agentId: agentId || 'unknown' };
+    return desktop.sessionScopeOf(exec);
 }
 /** Bind the executing call to the runtime: approval ids + observation owner. */
 function bindExec(exec) {
@@ -149,18 +146,23 @@ function failure(error) {
         return json(error.toJSON());
     return json({ ok: false, code: 'ACTION_FAILED', recovery: 'RETRY', message: error instanceof Error ? error.message : String(error) });
 }
-async function action(fn) {
-    try {
-        return json(await fn());
-    }
-    catch (error) {
-        return failure(error);
-    }
+async function action(exec, fn) {
+    // Bind the call context for everything fn awaits (observation validation
+    // reads the owner, the guard's approval hook reads the exec) so concurrent
+    // tool calls from other sessions cannot swap either mid-flight.
+    return desktop.runWithCallContext(exec, async () => {
+        try {
+            return json(await fn());
+        }
+        catch (error) {
+            return failure(error);
+        }
+    });
 }
 function actionParams() {
     return { observationId: { type: 'string', required: true, description: '最近一次 computer_get_window_state 返回的 observationId' } };
 }
-async function validate(args, requireAccessibilityTree = false) {
+async function validate(args, exec, requireAccessibilityTree = false) {
     const v = args;
     const windowId = resolveHwnd(v.windowId);
     if (typeof v.observationId !== 'string')
@@ -173,7 +175,8 @@ async function validate(args, requireAccessibilityTree = false) {
     if (v.clickCount !== undefined && (typeof v.clickCount !== 'number' || !Number.isInteger(v.clickCount) || v.clickCount < 1 || v.clickCount > 3)) {
         throw new Error('clickCount must be an integer from 1 to 3');
     }
-    return desktop.validateObservation(v.observationId, windowId, 'action', { requireAccessibilityTree });
+    const observationId = v.observationId;
+    return desktop.runWithCallContext(exec, () => desktop.validateObservation(observationId, windowId, 'action', { requireAccessibilityTree }));
 }
 export function defineListWindowsTool(deps) {
     return defineTool({ name: 'computer_list_apps', description: '列出当前 Windows 桌面窗口。', parameters: {}, output: { schema: { type: 'json' }, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 60_000, isConcurrencySafe: () => false, async execute() { gate(deps); void desktop.showOverlay(); return json({ windows: await desktop.listWindows() }); } });
@@ -184,7 +187,7 @@ export function defineGetWindowStateTool(deps) {
             gate(deps);
             bindExec(exec);
             const id = resolveHwnd(args.windowId);
-            return action(async () => {
+            return action(exec, async () => {
                 const current = await desktop.assertSafeWindow(id, 'observe');
                 const state = { ...current };
                 if (args.includeScreenshot !== false) {
@@ -202,7 +205,7 @@ export function defineGetWindowStateTool(deps) {
                     state.uiaChecksumMode = tree.mode;
                     state.uiaTruncated = tree.truncated;
                 }
-                const observation = await desktop.createObservation(id, state);
+                const observation = await desktop.runWithCallContext(exec, () => desktop.createObservation(id, state));
                 const value = { ...observation };
                 if (state.screenshotPath)
                     value.screenshotAttachment = await attach(deps.ctx, state.screenshotPath);
@@ -211,17 +214,17 @@ export function defineGetWindowStateTool(deps) {
         } });
 }
 export function defineActivateWindowTool(deps) {
-    return defineTool({ name: 'computer_activate_window', description: '激活指定窗口。', parameters: { windowId: { type: 'number', required: true } }, output: { schema: { type: 'json' }, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 60_000, isConcurrencySafe: () => false, async execute(args, exec) { gate(deps); bindExec(exec); const id = resolveHwnd(args.windowId); return action(() => { gate(deps); return desktop.activate(id); }); } });
+    return defineTool({ name: 'computer_activate_window', description: '激活指定窗口。', parameters: { windowId: { type: 'number', required: true } }, output: { schema: { type: 'json' }, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 60_000, isConcurrencySafe: () => false, async execute(args, exec) { gate(deps); bindExec(exec); const id = resolveHwnd(args.windowId); return action(exec, () => { gate(deps); return desktop.activate(id); }); } });
 }
 export function defineClickTool(deps) {
     return defineTool({ name: 'computer_click', description: '在最新 observation 对应窗口内点击：传 elementIndex 触发 UIA 元素级点击，或传 x/y 窗口相对坐标点击。', parameters: { windowId: { type: 'number', required: true }, ...actionParams(), elementIndex: { type: 'number', description: 'UI 树中的元素索引（与 x/y 二选一，优先）' }, x: { type: 'number', description: '窗口相对横坐标' }, y: { type: 'number', description: '窗口相对纵坐标' }, coordinateSpace: { type: 'string', enum: ['auto', 'screenshot', 'screen', 'window'], description: '坐标系，默认 auto' }, mouseButton: { type: 'string', enum: ['left', 'middle', 'right'] }, clickCount: { type: 'number' }, clickMethod: { type: 'string', enum: ['auto', 'post'], description: 'auto=前台真实鼠标点击；post=后台消息点击，默认 auto' } }, output: { schema: { type: 'json' }, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 120_000, isConcurrencySafe: () => false, async execute(args, exec) {
             gate(deps);
             bindExec(exec);
             const v = args;
-            const observation = await validate(v, v.elementIndex !== undefined);
+            const observation = await validate(v, exec, v.elementIndex !== undefined);
             const id = resolveHwnd(v.windowId);
             void desktop.showOverlay(id);
-            return action(() => {
+            return action(exec, () => {
                 gate(deps);
                 const button = v.mouseButton ?? 'left';
                 if (!['left', 'middle', 'right'].includes(button))
@@ -240,10 +243,10 @@ export function defineTypeTextTool(deps) {
             gate(deps);
             bindExec(exec);
             const v = args;
-            const observation = await validate(v);
+            const observation = await validate(v, exec);
             const id = resolveHwnd(v.windowId);
             void desktop.showOverlay(id);
-            return action(() => { gate(deps); return desktop.typeText(id, v.text, observation); });
+            return action(exec, () => { gate(deps); return desktop.typeText(id, v.text, observation); });
         } });
 }
 export function definePressKeyTool(deps) {
@@ -251,10 +254,10 @@ export function definePressKeyTool(deps) {
             gate(deps);
             bindExec(exec);
             const v = args;
-            const observation = await validate(v);
+            const observation = await validate(v, exec);
             const id = resolveHwnd(v.windowId);
             void desktop.showOverlay(id);
-            return action(() => { gate(deps); return desktop.pressKey(id, v.key, observation); });
+            return action(exec, () => { gate(deps); return desktop.pressKey(id, v.key, observation); });
         } });
 }
 export function defineScrollTool(deps) {
@@ -262,10 +265,10 @@ export function defineScrollTool(deps) {
             gate(deps);
             bindExec(exec);
             const v = args;
-            const observation = await validate(v, v.elementIndex !== undefined);
+            const observation = await validate(v, exec, v.elementIndex !== undefined);
             const id = resolveHwnd(v.windowId);
             void desktop.showOverlay(id);
-            return action(() => {
+            return action(exec, () => {
                 gate(deps);
                 const options = {};
                 if (v.elementIndex !== undefined)
@@ -279,10 +282,10 @@ export function defineDragTool(deps) {
             gate(deps);
             bindExec(exec);
             const v = args;
-            const observation = await validate(v, v.fromElementIndex !== undefined || v.toElementIndex !== undefined);
+            const observation = await validate(v, exec, v.fromElementIndex !== undefined || v.toElementIndex !== undefined);
             const id = resolveHwnd(v.windowId);
             void desktop.showOverlay(id);
-            return action(() => {
+            return action(exec, () => {
                 gate(deps);
                 const options = {};
                 if (v.fromElementIndex !== undefined)
@@ -299,7 +302,7 @@ export function defineLaunchAppTool(deps) {
             bindExec(exec);
             const v = args;
             void desktop.showOverlay();
-            return action(() => {
+            return action(exec, () => {
                 gate(deps);
                 return desktop.launchApp(v.app, Array.isArray(v.args) ? v.args : []);
             });

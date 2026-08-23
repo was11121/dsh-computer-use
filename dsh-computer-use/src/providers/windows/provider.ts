@@ -23,6 +23,7 @@ import { ComputerUseError } from '../../core/errors.ts'
 import { resolveWindowId, extractLegacyHwnd, type WindowId } from '../../core/identity.ts'
 import { windowsCapabilities, type Capabilities } from '../../core/capability.ts'
 import { checkLaunchApp } from '../../core/app-launch.ts'
+import { META_KEY_TOKENS } from '../../core/types.ts'
 import type {
   AccessibilityNode,
   AccessibilitySnapshot,
@@ -268,7 +269,11 @@ export class WindowsProvider implements DesktopProvider {
         return toActionResult('clipboard-paste', { chars: request.text.length })
       }
     } finally {
-      if (saved) native.restoreClipboard(key)
+      if (saved && !native.restoreClipboard(key)) {
+        // A failed restore would leave the just-typed (possibly secret) text on
+        // the shared system clipboard; wiping is the safe fallback.
+        try { native.setClipboardText('') } catch { /* best effort */ }
+      }
     }
     // The native SendInput fallback paces at ~10ms per char and blocks the JS
     // event loop, so a large payload would freeze the engine for minutes —
@@ -290,7 +295,9 @@ export class WindowsProvider implements DesktopProvider {
   async pressKey(request: PressKeyRequest): Promise<ActionResult> {
     const value = request.key
     const tokens = value.split('+').map((x) => x.trim().toLowerCase()).filter(Boolean)
-    if (!tokens.length || tokens.some((x) => ['win', 'windows', 'meta', 'cmd', 'command', 'super', 'os'].includes(x))) {
+    // Same shared token set as the runtime layer (covers X11 keysym spellings
+    // like super_l/meta_l too); a duplicated short list here would drift.
+    if (!tokens.length || tokens.some((x) => META_KEY_TOKENS.has(x))) {
       throw new ComputerUseError('FORBIDDEN_KEY', 'Windows/Meta shortcuts are not allowed', 'DENY')
     }
     const main = tokens.pop()!
@@ -299,6 +306,9 @@ export class WindowsProvider implements DesktopProvider {
     const mods = tokens.map((x) => WINDOWS_KEY_CODES[x])
     if (mods.some((code) => code === undefined)) throw new ComputerUseError('UNSUPPORTED_MODIFIER', 'Unsupported modifier key', 'DENY')
     if (isForbiddenChord(tokens, main)) throw new ComputerUseError('FORBIDDEN_KEY', 'System shortcut combinations are not allowed', 'DENY')
+    // PrintScreen copies the whole multi-monitor desktop into the shared
+    // clipboard, breaking the window-isolated capture promise.
+    if (main === 'printscreen') throw new ComputerUseError('FORBIDDEN_KEY', 'Full-screen capture keys are not allowed', 'DENY')
     await this.activateWindow(request.windowId)
     const held: number[] = []
     let mainHeld = false
@@ -415,6 +425,9 @@ export class WindowsProvider implements DesktopProvider {
       this.overlayHandle = 0
     }
     try { native.restoreSystemCursors() } catch { /* best effort */ }
+    // Release clipboard snapshots captured by paste flows whose session ended
+    // without a restore; each one pins an IDataObject and a COM apartment.
+    try { native.clearClipboardSnapshots() } catch { /* best effort */ }
   }
 
   private resolveElementIndex(elementId?: string): number {

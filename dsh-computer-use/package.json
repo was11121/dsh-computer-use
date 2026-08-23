@@ -38,6 +38,7 @@
     "build": "tsc -p tsconfig.json && node scripts/sync-client.mjs",
     "build:client": "node scripts/sync-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:build": "npm run build && (git diff --exit-code -- lib client || (echo 'ERROR: lib/ or client/ is stale relative to src/; run npm run build and commit the result' && exit 1))",
     "test:contract": "node --experimental-strip-types --test tests/contracts/*.test.ts",
     "test": "npm run test:contract",
     "test:native": "npm --prefix native run test:load"

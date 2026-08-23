@@ -29,10 +29,18 @@ function rpcError(error) {
     };
 }
 /**
+ * Minimum spacing between two APPLIED flips of the master switch. The switch
+ * writes settings and tears down the control session on every change, so a
+ * script in the web realm hammering the endpoint would otherwise churn the
+ * engine; human clicks through the permission panel can never be this fast.
+ */
+const FLIP_MIN_INTERVAL_MS = 300;
+/**
  * Register the loopback RPC channel. Returns a disposer for the plugin's
  * effect lifecycle.
  */
 export function registerComputerUseRpc(ctx, scope) {
+    let lastFlipAt = 0;
     const handle = ctx.connection.rpc.handle(COMPUTER_USE_RPC_CHANNEL, async (endpoint, payload) => {
         try {
             switch (endpoint) {
@@ -49,8 +57,12 @@ export function registerComputerUseRpc(ctx, scope) {
                     const allowed = value.allowed;
                     const changed = scope.get().allowControl !== allowed;
                     if (changed) {
+                        if (Date.now() - lastFlipAt < FLIP_MIN_INTERVAL_MS) {
+                            return rpcError(new Error('The control permission is being changed too quickly; please retry'));
+                        }
                         // 审计轨迹：这是桌面控制的总开关，翻转必须留痕。
                         ctx.logger.info(`[computer-use] allowControl changed to ${allowed}`);
+                        lastFlipAt = Date.now();
                         await scope.update({ allowControl: allowed });
                         stopControlSession();
                     }

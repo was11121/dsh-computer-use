@@ -31,6 +31,13 @@ export declare class GuardedDesktopProvider implements DesktopProvider {
     captureWindow(id: WindowId, path: string): Promise<CaptureResult>;
     activateWindow(id: WindowId): Promise<void>;
     accessibilityTree(id: WindowId): Promise<AccessibilitySnapshot>;
+    /**
+     * Re-verify the observed window generation right before a primitive runs.
+     * Without this delegation the TOCTOU narrowing in `core/actions.ts`
+     * (`ctx.provider.assertIdentity`) silently never fires, because the guarded
+     * wrapper hid the inner provider's implementation.
+     */
+    assertIdentity(id: WindowId, generation?: number): Promise<void>;
     click(request: ClickRequest): Promise<ActionResult>;
     typeText(request: TypeTextRequest): Promise<ActionResult>;
     pressKey(request: PressKeyRequest): Promise<ActionResult>;

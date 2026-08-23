@@ -63,8 +63,9 @@ declare module 'dsh-computer-use-macos-native' {
   export function elementRect(windowId: string, elementId: string): Rect
   export function saveClipboard(key?: string): boolean
   export function restoreClipboard(key?: string): boolean
+  /** Drop every clipboard snapshot without restoring; returns true. */
+  export function clearClipboardSnapshots(): boolean
   export function setClipboardText(text: string): boolean
-  export function getClipboardText(): string
   export function paste(): boolean
   export function overlayCreate(): number
   export function overlayShow(handle: number, windowId: string, text: string): boolean

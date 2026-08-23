@@ -53,6 +53,16 @@ export class GuardedDesktopProvider {
         this.gate('accessibilityTree', 'read accessibility tree');
         return this.inner.accessibilityTree(id);
     }
+    /**
+     * Re-verify the observed window generation right before a primitive runs.
+     * Without this delegation the TOCTOU narrowing in `core/actions.ts`
+     * (`ctx.provider.assertIdentity`) silently never fires, because the guarded
+     * wrapper hid the inner provider's implementation.
+     */
+    async assertIdentity(id, generation) {
+        this.gate('windowEnumeration', 'verify window identity');
+        await this.inner.assertIdentity?.(id, generation);
+    }
     async click(request) {
         await this.gateAsync('foregroundInput', 'simulate mouse click');
         return this.inner.click(request);

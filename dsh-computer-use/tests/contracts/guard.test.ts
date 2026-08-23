@@ -51,3 +51,33 @@ test('GuardedDesktopProvider runs approval for high-risk actions', async () => {
   await guarded.click({ windowId: 'win:1', x: 0, y: 0, button: 'left', count: 1 })
   assert.equal(approved, true)
 })
+
+test('GuardedDesktopProvider delegates assertIdentity to the inner provider', async () => {
+  // core/actions.ts calls provider.assertIdentity right before an action to
+  // re-verify the observed window generation; without the delegation on the
+  // guard wrapper that TOCTOU narrowing silently never fired.
+  const provider = new MockProvider()
+  let verified: { id: string; generation: number | undefined } | undefined
+  provider.assertIdentity = async (id, generation) => {
+    verified = { id, generation }
+  }
+  const guarded = new GuardedDesktopProvider(provider, { assertAllowed() {} })
+  await guarded.assertIdentity('win:hWnd:0000000000000001', 7)
+  assert.deepEqual(verified, { id: 'win:hWnd:0000000000000001', generation: 7 })
+})
+
+test('GuardedDesktopProvider.assertIdentity respects the permission gate', async () => {
+  const provider = new MockProvider()
+  let called = false
+  provider.assertIdentity = async () => { called = true }
+  const guarded = new GuardedDesktopProvider(provider, {
+    assertAllowed() { throw new Error('DSH control permission is off') },
+  })
+  await assert.rejects(() => guarded.assertIdentity('win:hWnd:0000000000000001', 7), /permission is off/)
+  assert.equal(called, false)
+})
+
+test('GuardedDesktopProvider.assertIdentity is a no-op when the inner provider cannot verify', async () => {
+  const guarded = new GuardedDesktopProvider(new MockProvider(), { assertAllowed() {} })
+  await guarded.assertIdentity('win:hWnd:0000000000000001', 7)
+})

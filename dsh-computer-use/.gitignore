@@ -5,3 +5,4 @@ native/build/
 # Cross-platform provider build output is not shipped by the Windows package.
 lib/providers/
 lib/types/providers/
+.mimosa/

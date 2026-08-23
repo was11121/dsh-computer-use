@@ -60,8 +60,12 @@ async function canonicalScreenshotRoot(config: ComputerUseConfig): Promise<strin
   if (isOutside(home, canonical)) throw new Error('The screenshot directory resolves outside the DSH home (junction/symlink)')
   return canonical
 }
+let screenshotSequence = 0
 async function screenshotPath(config: ComputerUseConfig, windowId: number): Promise<string> {
-  return join(await canonicalScreenshotRoot(config), `window-${windowId}-${Date.now()}.png`)
+  const dir = await canonicalScreenshotRoot(config)
+  // Two captures of the same window can land in the same millisecond; a
+  // monotonic suffix keeps the files (and their attachment records) distinct.
+  return join(dir, `window-${windowId}-${Date.now()}-${screenshotSequence++}.png`)
 }
 /** Delete screenshots older than the retention window (best effort). No
  * symlink/junction targets are ever followed: links and directories are
@@ -107,19 +111,12 @@ function gate(deps: ToolDeps): void {
 }
 
 /**
- * Session/agent scope for observation isolation. The exact Agent shape comes
- * from the harness (`@deepseek-ai/dsh-agent`); read defensively so a missing
- * field degrades to a stable "unknown" scope instead of throwing.
+ * Session/agent scope for observation isolation. Delegated to the runtime so
+ * the AsyncLocalStorage call context derives the same scope (see
+ * runWithCallContext); kept here only for the legacy bindExec fallback.
  */
 function sessionScope(exec: Exec): desktop.ObservationOwner {
-  const agent = exec.agent as { id?: unknown; session?: { id?: unknown; sessionId?: unknown } } | undefined
-  const session = agent?.session
-  const sessionValue = (session as { sessionId?: unknown } | undefined)?.sessionId
-  const sessionId = typeof session?.id === 'string' ? session.id
-    : typeof sessionValue === 'string' ? sessionValue
-    : 'unknown'
-  const agentId = typeof agent?.id === 'string' ? agent.id : 'unknown'
-  return { sessionId: sessionId || 'unknown', agentId: agentId || 'unknown' }
+  return desktop.sessionScopeOf(exec)
 }
 
 /** Bind the executing call to the runtime: approval ids + observation owner. */
@@ -136,13 +133,18 @@ function failure(error: unknown): JsonValue {
   if (error instanceof desktop.ComputerUseError) return json(error.toJSON())
   return json({ ok: false, code: 'ACTION_FAILED', recovery: 'RETRY', message: error instanceof Error ? error.message : String(error) })
 }
-async function action<T>(fn: () => Promise<T> | T): Promise<JsonValue> {
-  try { return json(await fn() as object) } catch (error) { return failure(error) }
+async function action<T>(exec: Exec, fn: () => Promise<T> | T): Promise<JsonValue> {
+  // Bind the call context for everything fn awaits (observation validation
+  // reads the owner, the guard's approval hook reads the exec) so concurrent
+  // tool calls from other sessions cannot swap either mid-flight.
+  return desktop.runWithCallContext(exec, async () => {
+    try { return json(await fn() as object) } catch (error) { return failure(error) }
+  })
 }
 function actionParams() {
   return { observationId: { type: 'string', required: true, description: '最近一次 computer_get_window_state 返回的 observationId' } } as const
 }
-async function validate(args: unknown, requireAccessibilityTree = false): Promise<desktop.Observation> {
+async function validate(args: unknown, exec: Exec, requireAccessibilityTree = false): Promise<desktop.Observation> {
   const v = args as { windowId?: number | string; observationId?: string; elementIndex?: unknown; fromElementIndex?: unknown; toElementIndex?: unknown; clickCount?: unknown }
   const windowId = resolveHwnd(v.windowId)
   if (typeof v.observationId !== 'string') throw new Error('observationId must be a string')
@@ -154,7 +156,8 @@ async function validate(args: unknown, requireAccessibilityTree = false): Promis
   if (v.clickCount !== undefined && (typeof v.clickCount !== 'number' || !Number.isInteger(v.clickCount) || v.clickCount < 1 || v.clickCount > 3)) {
     throw new Error('clickCount must be an integer from 1 to 3')
   }
-  return desktop.validateObservation(v.observationId, windowId, 'action', { requireAccessibilityTree })
+  const observationId = v.observationId
+  return desktop.runWithCallContext(exec, () => desktop.validateObservation(observationId, windowId, 'action', { requireAccessibilityTree }))
 }
 
 export function defineListWindowsTool(deps: ToolDeps) {
@@ -164,7 +167,7 @@ export function defineGetWindowStateTool(deps: ToolDeps) {
   return defineTool({ name: 'computer_get_window_state', description: '获取目标窗口的截图（只截该窗口，不泄露其他窗口）和 Windows UI Automation 观察结果。截图左上角是坐标原点；坐标按窗口相对处理，动作必须使用本次返回的 observationId。', parameters: { windowId: { type: 'number', required: true }, includeScreenshot: { type: 'boolean' }, includeText: { type: 'boolean' } }, output: { schema: { type: 'json' } as const, render: (_a, value) => { const v = value as { screenshotAttachment?: unknown }; const blocks: ContentBlock[] = []; if (v.screenshotAttachment !== undefined) blocks.push({ type: 'image', attachment: v.screenshotAttachment } as unknown as ContentBlock); blocks.push({ type: 'text', text: JSON.stringify(value) }); return blocks } }, timeoutMs: 180_000, isConcurrencySafe: () => false, async execute(args, exec) {
     gate(deps); bindExec(exec)
     const id = resolveHwnd((args as { windowId?: number | string }).windowId)
-    return action(async () => {
+    return action(exec, async () => {
       const current = await desktop.assertSafeWindow(id, 'observe')
       const state: desktop.WindowState = { ...current }
       if ((args as { includeScreenshot?: boolean }).includeScreenshot !== false) {
@@ -182,7 +185,7 @@ export function defineGetWindowStateTool(deps: ToolDeps) {
         state.uiaChecksumMode = tree.mode
         state.uiaTruncated = tree.truncated
       }
-      const observation = await desktop.createObservation(id, state)
+      const observation = await desktop.runWithCallContext(exec, () => desktop.createObservation(id, state))
       const value: Record<string, unknown> = { ...observation }
       if (state.screenshotPath) value.screenshotAttachment = await attach(deps.ctx, state.screenshotPath)
       return value
@@ -190,16 +193,16 @@ export function defineGetWindowStateTool(deps: ToolDeps) {
   } })
 }
 export function defineActivateWindowTool(deps: ToolDeps) {
-  return defineTool({ name: 'computer_activate_window', description: '激活指定窗口。', parameters: { windowId: { type: 'number', required: true } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 60_000, isConcurrencySafe: () => false, async execute(args, exec) { gate(deps); bindExec(exec); const id = resolveHwnd((args as { windowId?: number | string }).windowId); return action(() => { gate(deps); return desktop.activate(id) }) } })
+  return defineTool({ name: 'computer_activate_window', description: '激活指定窗口。', parameters: { windowId: { type: 'number', required: true } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 60_000, isConcurrencySafe: () => false, async execute(args, exec) { gate(deps); bindExec(exec); const id = resolveHwnd((args as { windowId?: number | string }).windowId); return action(exec, () => { gate(deps); return desktop.activate(id) }) } })
 }
 export function defineClickTool(deps: ToolDeps) {
   return defineTool({ name: 'computer_click', description: '在最新 observation 对应窗口内点击：传 elementIndex 触发 UIA 元素级点击，或传 x/y 窗口相对坐标点击。', parameters: { windowId: { type: 'number', required: true }, ...actionParams(), elementIndex: { type: 'number', description: 'UI 树中的元素索引（与 x/y 二选一，优先）' }, x: { type: 'number', description: '窗口相对横坐标' }, y: { type: 'number', description: '窗口相对纵坐标' }, coordinateSpace: { type: 'string', enum: ['auto', 'screenshot', 'screen', 'window'], description: '坐标系，默认 auto' }, mouseButton: { type: 'string', enum: ['left', 'middle', 'right'] }, clickCount: { type: 'number' }, clickMethod: { type: 'string', enum: ['auto', 'post'], description: 'auto=前台真实鼠标点击；post=后台消息点击，默认 auto' } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 120_000, isConcurrencySafe: () => false, async execute(args, exec) {
     gate(deps); bindExec(exec)
     const v = args as any
-    const observation = await validate(v, v.elementIndex !== undefined)
+    const observation = await validate(v, exec, v.elementIndex !== undefined)
     const id = resolveHwnd(v.windowId)
     void desktop.showOverlay(id)
-    return action(() => {
+    return action(exec, () => {
       gate(deps)
       const button = v.mouseButton ?? 'left'
       if (!['left', 'middle', 'right'].includes(button)) throw new Error('Invalid mouse button')
@@ -214,30 +217,30 @@ export function defineTypeTextTool(deps: ToolDeps) {
   return defineTool({ name: 'computer_type_text', description: '向最新 observation 对应窗口输入 Unicode 文本。', parameters: { windowId: { type: 'number', required: true }, ...actionParams(), text: { type: 'string', required: true } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 120_000, isConcurrencySafe: () => false, async execute(args, exec) {
     gate(deps); bindExec(exec)
     const v = args as any
-    const observation = await validate(v)
+    const observation = await validate(v, exec)
     const id = resolveHwnd(v.windowId)
     void desktop.showOverlay(id)
-    return action(() => { gate(deps); return desktop.typeText(id, v.text, observation) })
+    return action(exec, () => { gate(deps); return desktop.typeText(id, v.text, observation) })
   } })
 }
 export function definePressKeyTool(deps: ToolDeps) {
   return defineTool({ name: 'computer_press_key', description: '发送不包含 Windows/Meta 键的按键。', parameters: { windowId: { type: 'number', required: true }, ...actionParams(), key: { type: 'string', required: true } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 120_000, isConcurrencySafe: () => false, async execute(args, exec) {
     gate(deps); bindExec(exec)
     const v = args as any
-    const observation = await validate(v)
+    const observation = await validate(v, exec)
     const id = resolveHwnd(v.windowId)
     void desktop.showOverlay(id)
-    return action(() => { gate(deps); return desktop.pressKey(id, v.key, observation) })
+    return action(exec, () => { gate(deps); return desktop.pressKey(id, v.key, observation) })
   } })
 }
 export function defineScrollTool(deps: ToolDeps) {
   return defineTool({ name: 'computer_scroll', description: '在窗口内滚动：传 elementIndex 则在该元素中心滚动，否则在 x/y 窗口相对坐标处滚动。', parameters: { windowId: { type: 'number', required: true }, ...actionParams(), elementIndex: { type: 'number', description: 'UI 树中的元素索引（与 x/y 二选一，优先）' }, x: { type: 'number', description: '窗口相对横坐标' }, y: { type: 'number', description: '窗口相对纵坐标' }, coordinateSpace: { type: 'string', enum: ['auto', 'screenshot', 'screen', 'window'], description: '坐标系，默认 auto' }, scrollX: { type: 'number' }, scrollY: { type: 'number' } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 120_000, isConcurrencySafe: () => false, async execute(args, exec) {
     gate(deps); bindExec(exec)
     const v = args as any
-    const observation = await validate(v, v.elementIndex !== undefined)
+    const observation = await validate(v, exec, v.elementIndex !== undefined)
     const id = resolveHwnd(v.windowId)
     void desktop.showOverlay(id)
-    return action(() => {
+    return action(exec, () => {
       gate(deps)
       const options: desktop.ScrollOptions = {}
       if (v.elementIndex !== undefined) options.elementIndex = v.elementIndex
@@ -249,10 +252,10 @@ export function defineDragTool(deps: ToolDeps) {
   return defineTool({ name: 'computer_drag', description: '在窗口内拖动：可用元素索引或窗口相对坐标指定起点/终点。', parameters: { windowId: { type: 'number', required: true }, ...actionParams(), fromElementIndex: { type: 'number', description: '起点元素索引（与 fromX/fromY 二选一，优先）' }, toElementIndex: { type: 'number', description: '终点元素索引（与 toX/toY 二选一，优先）' }, fromX: { type: 'number', description: '起点窗口相对横坐标' }, fromY: { type: 'number', description: '起点窗口相对纵坐标' }, toX: { type: 'number', description: '终点窗口相对横坐标' }, toY: { type: 'number', description: '终点窗口相对纵坐标' }, coordinateSpace: { type: 'string', enum: ['auto', 'screenshot', 'screen', 'window'], description: '坐标系，默认 auto' } }, output: { schema: { type: 'json' } as const, render: (_a, v) => textOutput(JSON.stringify(v)) }, timeoutMs: 120_000, isConcurrencySafe: () => false, async execute(args, exec) {
     gate(deps); bindExec(exec)
     const v = args as any
-    const observation = await validate(v, v.fromElementIndex !== undefined || v.toElementIndex !== undefined)
+    const observation = await validate(v, exec, v.fromElementIndex !== undefined || v.toElementIndex !== undefined)
     const id = resolveHwnd(v.windowId)
     void desktop.showOverlay(id)
-    return action(() => {
+    return action(exec, () => {
       gate(deps)
       const options: desktop.DragOptions = {}
       if (v.fromElementIndex !== undefined) options.fromElementIndex = v.fromElementIndex
@@ -266,7 +269,7 @@ export function defineLaunchAppTool(deps: ToolDeps) {
     gate(deps); bindExec(exec)
     const v = args as any
     void desktop.showOverlay()
-    return action(() => {
+    return action(exec, () => {
       gate(deps)
       return desktop.launchApp(v.app, Array.isArray(v.args) ? v.args : [])
     })

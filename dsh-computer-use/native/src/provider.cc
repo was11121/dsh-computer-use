@@ -25,6 +25,7 @@
 #include <map>
 #include <deque>
 #include <cmath>
+#include <random>
 
 using namespace Napi;
 using namespace Gdiplus;
@@ -50,14 +51,21 @@ static RECT virtualScreenRect();
 // against the old generation is rejected. This is the TOCTOU guard the
 // TS-side observation validation compares.
 static const wchar_t* kGenerationProp = L"DSH_CU_WINDOW_GENERATION";
-static uint64_t generationCounter = 0;
 
 static uint64_t windowGeneration(HWND h) {
   if (!IsWindow(h)) return 0;
   HANDLE v = GetPropW(h, kGenerationProp);
   if (v) return (uint64_t)(uintptr_t)v;
-  uint64_t gen = ++generationCounter;
-  // gen 0 is reserved (NULL handle); wrap-around is unreachable in practice.
+  // Fresh tokens are fully random (MSVC std::random_device is rand_s /
+  // RtlGenRandom -- cryptographically seeded). A predictable counter let a
+  // hostile process enumerate the property off live windows, predict the next
+  // value and pre-set it after HWND reuse, defeating the TOCTOU guard; a
+  // random 64-bit token is unguessable for a window that never carried it.
+  std::random_device rd;
+  uint64_t gen = 0;
+  do {
+    gen = ((uint64_t)rd() << 32) | (uint64_t)rd();
+  } while (gen == 0); // 0 is reserved (NULL prop handle)
   SetPropW(h, kGenerationProp, (HANDLE)(uintptr_t)gen);
   return gen;
 }
@@ -185,44 +193,10 @@ static RECT virtualScreenRect() {
   return r;
 }
 
-static bool saveScreenRect(const RECT& r, const std::wstring& file) {
-  int w = r.right - r.left;
-  int h = r.bottom - r.top;
-  if (w <= 0 || h <= 0) return false;
-  HDC screen = GetDC(nullptr);
-  if (!screen) return false;
-  HDC mem = CreateCompatibleDC(screen);
-  HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
-  if (!mem || !bmp) {
-    if (bmp) DeleteObject(bmp);
-    if (mem) DeleteDC(mem);
-    if (screen) ReleaseDC(nullptr, screen);
-    return false;
-  }
-  HGDIOBJ old = SelectObject(mem, bmp);
-  if (!old || old == HGDI_ERROR) {
-    DeleteObject(bmp);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
-    return false;
-  }
-  BOOL copied = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
-  SelectObject(mem, old);
-  DeleteDC(mem);
-  ReleaseDC(nullptr, screen);
-  if (!copied) { DeleteObject(bmp); return false; }
-  ensureGdiplus();
-  if (!gdiplusToken) { DeleteObject(bmp); return false; }
-  bool ok = false;
-  {
-    Bitmap image(bmp, (HPALETTE)nullptr);
-    CLSID png;
-    CLSIDFromString(L"{557cf406-1a04-11d3-9a73-0000f81ef32e}", &png);
-    ok = image.Save(file.c_str(), &png) == Ok;
-  }
-  DeleteObject(bmp);
-  return ok;
-}
+// NOTE: full-screen capture (saveScreenRect/CaptureScreen) and the screenRect
+// export were removed during the 2026-08 audit: nothing in the plugin used
+// them, and a full-desktop capture to a caller-supplied path would violate
+// the window-isolation capture promise the plugin makes.
 
 // ---------- window enumeration ----------
 static Value ListWindows(const CallbackInfo& info) {
@@ -297,6 +271,11 @@ struct ClipboardSnapshot {
   bool ownsCom = false;
 };
 static std::map<std::string, ClipboardSnapshot> clipboardSnapshots;
+// Insertion order of live snapshot keys: sessions that die without a restore
+// would otherwise pin their IDataObject (and its COM apartment) forever. The
+// cap evicts the least recently saved key, bounding the leak.
+static std::deque<std::string> clipboardSnapshotOrder;
+const size_t kMaxClipboardSnapshots = 8;
 
 static std::string clipboardKey(const CallbackInfo& info, int n = 0) {
   if (info.Length() > n && info[n].IsString()) return info[n].ToString().Utf8Value();
@@ -309,12 +288,22 @@ static void clearClipboardSnapshot(const std::string& key) {
   if (it->second.data) it->second.data->Release();
   if (it->second.ownsCom) CoUninitialize();
   clipboardSnapshots.erase(it);
+  for (auto o = clipboardSnapshotOrder.begin(); o != clipboardSnapshotOrder.end(); ++o) {
+    if (*o == key) { clipboardSnapshotOrder.erase(o); break; }
+  }
+}
+
+static void clearClipboardSnapshotsAll() {
+  while (!clipboardSnapshots.empty())
+    clearClipboardSnapshot(clipboardSnapshots.begin()->first);
 }
 
 static Value ClipboardSave(const CallbackInfo& info) {
   Env env = info.Env();
   std::string key = clipboardKey(info);
   clearClipboardSnapshot(key);
+  while (clipboardSnapshots.size() >= kMaxClipboardSnapshots && !clipboardSnapshotOrder.empty())
+    clearClipboardSnapshot(clipboardSnapshotOrder.front());
   HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   // Only a fresh S_OK init is owned; S_FALSE (already initialized) and
   // RPC_E_CHANGED_MODE (foreign apartment) must not be un-initialized here.
@@ -328,6 +317,7 @@ static Value ClipboardSave(const CallbackInfo& info) {
     return Boolean::New(env, false);
   }
   clipboardSnapshots[key] = { data, ownsCom };
+  clipboardSnapshotOrder.push_back(key);
   return Boolean::New(env, true);
 }
 
@@ -342,18 +332,17 @@ static Value ClipboardRestore(const CallbackInfo& info) {
   return Boolean::New(env, ok);
 }
 
-static Value ClipboardGet(const CallbackInfo& info) {
-  Env env = info.Env();
-  std::wstring out;
-  if (!OpenClipboard(nullptr)) return String::New(env, (const char16_t*)out.data(), 0);
-  HANDLE h = GetClipboardData(CF_UNICODETEXT);
-  if (h) {
-    wchar_t* p = (wchar_t*)GlobalLock(h);
-    if (p) { out = p; GlobalUnlock(h); }
-  }
-  CloseClipboard();
-  return String::New(env, (const char16_t*)out.c_str(), out.size());
+// Drop every snapshot without touching the live clipboard: used on control
+// session teardown so a session that died mid paste-flow cannot leak its
+// captured IDataObject and COM apartment.
+static Value ClipboardClearAll(const CallbackInfo& info) {
+  clearClipboardSnapshotsAll();
+  return Boolean::New(info.Env(), true);
 }
+
+// NOTE: ClipboardGet (read the shared system clipboard) was removed during the
+// 2026-08 audit -- nothing in the plugin used it and it exported the whole
+// shared clipboard to any same-process caller.
 
 static Value ClipboardSet(const CallbackInfo& info) {
   std::u16string s = info[0].ToString().Utf16Value();
@@ -423,16 +412,9 @@ static Value PostWheel(const CallbackInfo& info) {
   return Boolean::New(info.Env(), PostMessageW(h, horizontal ? WM_MOUSEHWHEEL : WM_MOUSEWHEEL, wp, MAKELPARAM(pt.x, pt.y)) != FALSE);
 }
 
-static Value PostChar(const CallbackInfo& info) {
-  HWND h = hwndOf(info);
-  std::u16string s = info[1].ToString().Utf16Value();
-  if (!IsWindow(h) || s.empty()) return Boolean::New(info.Env(), false);
-  for (char16_t c : s) {
-    if (!PostMessageW(h, WM_CHAR, (WPARAM)c, 0)) return Boolean::New(info.Env(), false);
-    Sleep(8);
-  }
-  return Boolean::New(info.Env(), true);
-}
+// NOTE: PostChar (per-char WM_CHAR with an unbounded Sleep(8) pace) was
+// removed during the 2026-08 audit -- it was exported but never called by the
+// provider layer.
 
 static Value Key(const CallbackInfo& info) {
   INPUT in{};
@@ -500,6 +482,17 @@ static bool invokeAtPoint(HWND target, int screenX, int screenY, int count) {
         SUCCEEDED(rootElement->FindAll(TreeScope_Subtree, condition, &elements)) && elements) {
       int length = 0;
       elements->get_Length(&length);
+      // Same order-of-magnitude bound as Uia(): walking a browser-scale tree
+      // over cross-process COM blocks the JS event loop for seconds. Trees
+      // that large fail closed (the foreground click path still works).
+      if (length > 2000) {
+        elements->Release();
+        condition->Release();
+        rootElement->Release();
+        uia->Release();
+        if (ownsCom) CoUninitialize();
+        return false;
+      }
       IUIAutomationElement* best = nullptr;
       long bestArea = LONG_MAX;
       for (int i = 0; i < length; i++) {
@@ -784,14 +777,6 @@ static Value Capture(const CallbackInfo& info) {
   return Boolean::New(env, ok);
 }
 
-static Value ScreenRect(const CallbackInfo& info) {
-  return rectObj(info.Env(), virtualScreenRect());
-}
-
-static Value CaptureScreen(const CallbackInfo& info) {
-  return Boolean::New(info.Env(), saveScreenRect(virtualScreenRect(), utf16(info[0].ToString().Utf16Value())));
-}
-
 // ---------- UI Automation ----------
 static Value Uia(const CallbackInfo& info) {
   Env env = info.Env();
@@ -843,7 +828,13 @@ static Value Uia(const CallbackInfo& info) {
     o.Set("visible", !off);
     o.Set("childCount", 0);
     nodes.Set(count, o);
-    sum << count << ":" << parent << ":" << (name ? utf8(name) : "") << ":"
+    // Length-prefix the free-form strings: a name containing ':' or ';' could
+    // otherwise be crafted so that two different trees serialize identically,
+    // defeating the "tree unchanged" check that gates element actions.
+    sum << count << ":" << parent << ":"
+        << (name ? (uint64_t)SysStringLen(name) : (uint64_t)0) << ":"
+        << (name ? utf8(name) : "") << ":"
+        << (aid ? (uint64_t)SysStringLen(aid) : (uint64_t)0) << ":"
         << (aid ? utf8(aid) : "") << ":" << role << ":"
         << rr.left << "," << rr.top << "," << rr.right << "," << rr.bottom << ":"
         << (en ? "1" : "0") << (off ? "0" : "1") << ";";
@@ -1246,6 +1237,23 @@ static std::wstring cursorFilePath() {
   return path;
 }
 
+// Swap marker: while the system cursors are replaced, this file exists in
+// %TEMP%. If the engine dies mid-session (crash, kill) the swap survives the
+// process, so the next Init() sees the marker and restores the default
+// cursors instead of leaving the user with the takeover cursor forever.
+static std::wstring cursorSwapMarkerPath() {
+  wchar_t tmp[MAX_PATH]{};
+  GetTempPathW(MAX_PATH, tmp);
+  return std::wstring(tmp) + L"dsh-cursor-swap.marker";
+}
+
+static void restoreCursorsAfterCrash() {
+  const std::wstring marker = cursorSwapMarkerPath();
+  if (GetFileAttributesW(marker.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+  SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0);
+  DeleteFileW(marker.c_str());
+}
+
 static bool setSystemCursors(bool enabled) {
   static bool swapped = false;
   if (enabled) {
@@ -1260,11 +1268,14 @@ static bool setSystemCursors(bool enabled) {
     }
     DestroyIcon(h);
     swapped = true;
+    HANDLE fh = CreateFileW(cursorSwapMarkerPath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
     return true;
   }
   if (swapped) {
     SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0);
     swapped = false;
+    DeleteFileW(cursorSwapMarkerPath().c_str());
   }
   return true;
 }
@@ -1277,7 +1288,14 @@ static Value OverlayCreate(const CallbackInfo& info) {
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
   wc.lpfnWndProc = OverlayProc;
-  wc.hInstance = GetModuleHandleW(nullptr);
+  // Register the class on THIS addon's module, not the host EXE
+  // (GetModuleHandleW(nullptr)): a class registered on the EXE module can be
+  // pre-empted by any other component in the process registering the same
+  // name with its own wndproc.
+  HINSTANCE addonInstance = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     (LPCWSTR)&OverlayProc, &addonInstance);
+  wc.hInstance = addonInstance;
   wc.lpszClassName = L"DSHComputerUseOverlay";
   if (!GetClassInfoExW(wc.hInstance, wc.lpszClassName, &wc)) {
     if (!RegisterClassExW(&wc)) throw Error::New(env, "OVERLAY_REGISTER_FAILED");
@@ -1376,12 +1394,11 @@ static Value RestoreCursors(const CallbackInfo& info) {
 // ---------- module ----------
 Object Init(Env env, Object exports) {
   EnsureDpiAware();
+  restoreCursorsAfterCrash();
   exports.Set("listWindows", Function::New(env, ListWindows));
   exports.Set("getWindow", Function::New(env, QueryWindow));
   exports.Set("verifyWindow", Function::New(env, VerifyWindow));
   exports.Set("captureWindow", Function::New(env, Capture));
-  exports.Set("screenRect", Function::New(env, ScreenRect));
-  exports.Set("captureScreen", Function::New(env, CaptureScreen));
   exports.Set("activateWindow", Function::New(env, Activate));
   exports.Set("invokeAtPoint", Function::New(env, BackgroundInvoke));
   exports.Set("elementClick", Function::New(env, ElementClick));
@@ -1394,11 +1411,10 @@ Object Init(Env env, Object exports) {
   exports.Set("drag", Function::New(env, Drag));
   exports.Set("postClick", Function::New(env, PostClick));
   exports.Set("postWheel", Function::New(env, PostWheel));
-  exports.Set("postChar", Function::New(env, PostChar));
   exports.Set("saveClipboard", Function::New(env, ClipboardSave));
   exports.Set("restoreClipboard", Function::New(env, ClipboardRestore));
+  exports.Set("clearClipboardSnapshots", Function::New(env, ClipboardClearAll));
   exports.Set("setClipboardText", Function::New(env, ClipboardSet));
-  exports.Set("getClipboardText", Function::New(env, ClipboardGet));
   exports.Set("paste", Function::New(env, Paste));
   exports.Set("accessibilityTree", Function::New(env, Uia));
   exports.Set("overlayCreate", Function::New(env, OverlayCreate));

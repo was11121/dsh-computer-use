@@ -15,6 +15,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { ComputerUseError, type ActionErrorCode } from './core/errors.ts'
 import { brandProtected as brandProtectedCore } from './core/protection.ts'
@@ -64,7 +65,7 @@ const TREE_MAX_DEPTH = 32
 // Provider + guard construction (production wiring for createProvider /
 // guardProvider / core actions).
 // ---------------------------------------------------------------------------
-interface ApprovalExec {
+export interface ApprovalExec {
   agent?: unknown
   name: string
   callId: unknown
@@ -84,6 +85,18 @@ let approvalExec: ApprovalExec | undefined
 /** Current observation owner (session/agent), set by the tool layer per call. */
 let currentOwner: ObservationOwner = { sessionId: 'unknown', agentId: 'unknown' }
 
+/**
+ * Per-call execution context (approval exec + observation owner).
+ *
+ * The old module-level globals were shared across every concurrent tool call:
+ * while agent A's action sat in the approval dialog, agent B's call replaced
+ * the globals, so A's approval request was filed under B's toolName/callId —
+ * the user approved one action and a different one ran. The AsyncLocalStorage
+ * binds both to each call's own async chain instead; the globals remain only
+ * as a fallback for entry points that never wrapped a call context.
+ */
+const callContext = new AsyncLocalStorage<{ exec: ApprovalExec; owner: ObservationOwner }>()
+
 export function initRuntime(h: RuntimeHooks): void {
   hooks = h
 }
@@ -91,6 +104,39 @@ export function initRuntime(h: RuntimeHooks): void {
 /** Attach the executing tool call so approval questions carry the right ids. */
 export function setApprovalContext(exec: ApprovalExec): void {
   approvalExec = exec
+}
+
+/**
+ * Session/agent scope for observation isolation and approval identity. Read
+ * defensively so a missing field degrades to a stable "unknown" scope.
+ */
+export function sessionScopeOf(exec: ApprovalExec | undefined): ObservationOwner {
+  const agent = exec?.agent as { id?: unknown; session?: { id?: unknown; sessionId?: unknown } } | undefined
+  const session = agent?.session
+  const sessionId =
+    typeof session?.id === 'string' ? session.id
+    : typeof session?.sessionId === 'string' ? (session.sessionId as string)
+    : 'unknown'
+  const agentId = typeof agent?.id === 'string' ? agent.id : 'unknown'
+  return { sessionId: sessionId || 'unknown', agentId: agentId || 'unknown' }
+}
+
+/** Run `fn` with `exec` (and its derived observation owner) bound to the call chain. */
+export function runWithCallContext<T>(exec: ApprovalExec, fn: () => Promise<T> | T): Promise<T> | T {
+  return callContext.run({ exec, owner: sessionScopeOf(exec) }, fn)
+}
+
+/** Internal: the active call context; tests verify chain isolation. */
+export function __activeCallContextForTest(): { exec: ApprovalExec; owner: ObservationOwner } | null {
+  return callContext.getStore() ?? null
+}
+
+function activeExec(): ApprovalExec | undefined {
+  return callContext.getStore()?.exec ?? approvalExec
+}
+
+function activeOwner(): ObservationOwner {
+  return callContext.getStore()?.owner ?? currentOwner
 }
 
 async function ensureProvider(): Promise<DesktopProvider> {
@@ -105,11 +151,12 @@ async function approveAction(reason: string): Promise<void> {
   if (!config.requireApproval) return
   // Fail closed: approval is on, so a tool call without an exec context must be
   // denied instead of silently running unapproved desktop input.
-  if (approvalExec === undefined || approvalExec.agent === undefined) {
+  const exec = activeExec()
+  if (exec === undefined || exec.agent === undefined) {
     await stopControlIndicator()
     throw new Error('Approval context is missing; this computer-control action is denied')
   }
-  const agent = approvalExec.agent as { session?: { events?: readonly unknown[] } }
+  const agent = exec.agent as { session?: { events?: readonly unknown[] } }
   const policy = effectiveApprovalPolicy((agent.session?.events ?? []) as never)
   if (policy === 'never') {
     if (config.skipApprovalWhenPolicyNever) return
@@ -118,10 +165,10 @@ async function approveAction(reason: string): Promise<void> {
   }
   const outcome = await h.ctx.approval.request({
     agent: agent as never,
-    toolName: approvalExec.name,
-    callId: approvalExec.callId as never,
+    toolName: exec.name,
+    callId: exec.callId as never,
     reason,
-    signal: approvalExec.signal,
+    signal: exec.signal,
   })
   if (outcome !== 'allowed-once') {
     await stopControlIndicator()
@@ -137,11 +184,14 @@ async function ensureGuarded(): Promise<ReturnType<typeof guardProvider>> {
         if (!config?.enabled) throw new Error('计算机控制插件未启用')
         if (!config.allowControl) throw new Error('DSH control permission is off: please enable the "Allow DSH to control the computer" switch next to the chat box')
       },
-      // Approval runs exactly once, inside the guard. Screenshot capture and
-      // plain activation are deliberately NOT approval-gated (legacy
-      // behavior); the interactive gate applies to input/launch actions only.
+      // Approval runs exactly once, inside the guard. Screenshot capture is
+      // deliberately NOT approval-gated (legacy behavior): providers restore a
+      // minimized target through their own inner activateWindow before
+      // capturing, which never passes through this guard. The interactive
+      // `computer_activate_window` tool DOES pass through here, so raising an
+      // arbitrary window to the foreground (a phishing amplifier) asks first.
       approve: async (reason) => {
-        if (reason.startsWith('capture window') || reason.startsWith('activate window')) return
+        if (reason.startsWith('capture window')) return
         await approveAction(reason)
       },
     }
@@ -235,7 +285,7 @@ export async function createObservation(windowId: number | WindowId, value: Wind
   const window = await getWindow(id)
   const { windowId: _ignored, ...rest } = value
   void _ignored
-  return createCoreObservation(window, rest, currentOwner)
+  return createCoreObservation(window, rest, activeOwner())
 }
 
 export interface ObservationValidationOptions {
@@ -251,7 +301,7 @@ export async function validateObservation(
   const id = normalizeWindowId(windowId)
   return validateCoreObservation(observationId, id, await ensureGuarded(), action, {
     requireAccessibilityTree: options.requireAccessibilityTree,
-    owner: currentOwner,
+    owner: activeOwner(),
   })
 }
 
@@ -330,8 +380,13 @@ async function syncOverlay(windowId: number | WindowId = 0): Promise<void> {
     if (overlay.timer) clearTimeout(overlay.timer)
     if (overlay.pulseTimer) clearInterval(overlay.pulseTimer)
     const native = await ensureProvider()
-    const pulse = native.refreshIndicator
-    if (pulse) overlay.pulseTimer = setInterval(() => { void pulse().catch(() => undefined) }, 100)
+    // Invoke through the instance: detaching the method (`const pulse = native.refreshIndicator`)
+    // ran it with `this === undefined`, so every tick returned a rejected
+    // promise that the .catch() below swallowed — the pulse animation never ran.
+    const pulse = (): Promise<void> => native.refreshIndicator?.() ?? Promise.resolve()
+    if (native.refreshIndicator) {
+      overlay.pulseTimer = setInterval(() => { void pulse().catch(() => undefined) }, 100)
+    }
     overlay.timer = setTimeout(() => void hideOverlayNow(true), Math.max(1_000, overlay.config.overlayIdleMs))
   } catch { /* overlay is best effort */ }
 }
@@ -390,7 +445,7 @@ export async function click(
   }
   try {
     const result = await runClick(
-      { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id },
+      { provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'click', windowId: id },
       { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' },
     )
     await showOverlay(id)
@@ -408,8 +463,9 @@ export async function typeText(windowId: number | WindowId, value: string, obser
   await actionObservation(observation, id, 'type')
   await assertSafeWindow(id, 'type')
   if (value.length > 20_000) throw new ComputerUseError('INPUT_TOO_LARGE', 'A single input supports at most 20000 characters', 'DENY')
+  const owner = activeOwner()
   const result = await runTypeText(
-    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` },
+    { provider: await ensureGuarded(), observation, owner, action: 'type', windowId: id, clipboardKey: `${owner.sessionId}:${owner.agentId}` },
     value,
   )
   await showOverlay(id)
@@ -430,6 +486,10 @@ const FORBIDDEN_CHORDS: { mods: string[]; key: string }[] = [
 function isForbiddenChord(mods: string[], main: string): boolean {
   return FORBIDDEN_CHORDS.some((c) => c.key === main && c.mods.every((m) => mods.includes(m)))
 }
+// Main keys that leak beyond the target window even without modifiers:
+// PrintScreen copies the whole multi-monitor desktop into the shared clipboard,
+// which breaks this plugin's window-isolated capture promise.
+const FORBIDDEN_MAIN_KEYS = new Set(['printscreen'])
 export async function pressKey(windowId: number | WindowId, value: string, observation?: Observation): Promise<object> {
   const id = normalizeWindowId(windowId)
   await actionObservation(observation, id, 'press key')
@@ -443,8 +503,9 @@ export async function pressKey(windowId: number | WindowId, value: string, obser
   }
   const main = tokens.pop()!
   if (isForbiddenChord(tokens, main)) throw new ComputerUseError('FORBIDDEN_KEY', 'System shortcut combinations are not allowed', 'DENY')
+  if (FORBIDDEN_MAIN_KEYS.has(main)) throw new ComputerUseError('FORBIDDEN_KEY', 'Full-screen capture keys are not allowed', 'DENY')
   const result = await runPressKey(
-    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id },
+    { provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'press key', windowId: id },
     value,
   )
   await showOverlay(id)
@@ -481,7 +542,7 @@ export async function scroll(
     space = 'screen'
   }
   const result = await runScroll(
-    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id },
+    { provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'scroll', windowId: id },
     { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space },
   )
   await showOverlay(id)
@@ -515,7 +576,7 @@ export async function drag(
     await actionObservation(observation, id, 'drag', true)
   }
   const result = await runDrag(
-    { provider: await ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id },
+    { provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'drag', windowId: id },
     { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' },
   )
   await showOverlay(id)

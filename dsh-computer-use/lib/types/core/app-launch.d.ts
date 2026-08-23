@@ -7,6 +7,12 @@
  * These checks close the concrete bypasses found in review: separator
  * confusion (`C:\Windows\System32\cmd.exe` passed the old `/`-only split),
  * missing macOS/Linux block lists, control characters, and path traversal.
+ * They also block execution vehicles that take a command from argv
+ * (`env bash -c ...`, `nohup`, `timeout`, `xargs`, `find -exec`, `awk`,
+ * `git ext:`, `ssh ProxyCommand=`, `wsl bash -c`, `schtasks /tr`,
+ * `explorer.exe evil.lnk`, ...), versioned interpreter stems (`python3.13`,
+ * `pythonw`, `pypy3`), and shell-executed document types (`.desktop`,
+ * `.command`, `.scpt`, `.jnlp`, `.settingcontent-ms`).
  * @module
  */
 export interface AppLaunch {

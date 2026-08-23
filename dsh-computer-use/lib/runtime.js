@@ -13,6 +13,7 @@
  * approval, session-isolation and TOCTOU gates without per-platform code.
  * @module
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { effectiveApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import { ComputerUseError } from "./core/errors.js";
 import { brandProtected as brandProtectedCore } from "./core/protection.js";
@@ -35,12 +36,50 @@ let guarded = null;
 let approvalExec;
 /** Current observation owner (session/agent), set by the tool layer per call. */
 let currentOwner = { sessionId: 'unknown', agentId: 'unknown' };
+/**
+ * Per-call execution context (approval exec + observation owner).
+ *
+ * The old module-level globals were shared across every concurrent tool call:
+ * while agent A's action sat in the approval dialog, agent B's call replaced
+ * the globals, so A's approval request was filed under B's toolName/callId —
+ * the user approved one action and a different one ran. The AsyncLocalStorage
+ * binds both to each call's own async chain instead; the globals remain only
+ * as a fallback for entry points that never wrapped a call context.
+ */
+const callContext = new AsyncLocalStorage();
 export function initRuntime(h) {
     hooks = h;
 }
 /** Attach the executing tool call so approval questions carry the right ids. */
 export function setApprovalContext(exec) {
     approvalExec = exec;
+}
+/**
+ * Session/agent scope for observation isolation and approval identity. Read
+ * defensively so a missing field degrades to a stable "unknown" scope.
+ */
+export function sessionScopeOf(exec) {
+    const agent = exec?.agent;
+    const session = agent?.session;
+    const sessionId = typeof session?.id === 'string' ? session.id
+        : typeof session?.sessionId === 'string' ? session.sessionId
+            : 'unknown';
+    const agentId = typeof agent?.id === 'string' ? agent.id : 'unknown';
+    return { sessionId: sessionId || 'unknown', agentId: agentId || 'unknown' };
+}
+/** Run `fn` with `exec` (and its derived observation owner) bound to the call chain. */
+export function runWithCallContext(exec, fn) {
+    return callContext.run({ exec, owner: sessionScopeOf(exec) }, fn);
+}
+/** Internal: the active call context; tests verify chain isolation. */
+export function __activeCallContextForTest() {
+    return callContext.getStore() ?? null;
+}
+function activeExec() {
+    return callContext.getStore()?.exec ?? approvalExec;
+}
+function activeOwner() {
+    return callContext.getStore()?.owner ?? currentOwner;
 }
 async function ensureProvider() {
     if (!provider)
@@ -56,11 +95,12 @@ async function approveAction(reason) {
         return;
     // Fail closed: approval is on, so a tool call without an exec context must be
     // denied instead of silently running unapproved desktop input.
-    if (approvalExec === undefined || approvalExec.agent === undefined) {
+    const exec = activeExec();
+    if (exec === undefined || exec.agent === undefined) {
         await stopControlIndicator();
         throw new Error('Approval context is missing; this computer-control action is denied');
     }
-    const agent = approvalExec.agent;
+    const agent = exec.agent;
     const policy = effectiveApprovalPolicy((agent.session?.events ?? []));
     if (policy === 'never') {
         if (config.skipApprovalWhenPolicyNever)
@@ -70,10 +110,10 @@ async function approveAction(reason) {
     }
     const outcome = await h.ctx.approval.request({
         agent: agent,
-        toolName: approvalExec.name,
-        callId: approvalExec.callId,
+        toolName: exec.name,
+        callId: exec.callId,
         reason,
-        signal: approvalExec.signal,
+        signal: exec.signal,
     });
     if (outcome !== 'allowed-once') {
         await stopControlIndicator();
@@ -90,11 +130,14 @@ async function ensureGuarded() {
                 if (!config.allowControl)
                     throw new Error('DSH control permission is off: please enable the "Allow DSH to control the computer" switch next to the chat box');
             },
-            // Approval runs exactly once, inside the guard. Screenshot capture and
-            // plain activation are deliberately NOT approval-gated (legacy
-            // behavior); the interactive gate applies to input/launch actions only.
+            // Approval runs exactly once, inside the guard. Screenshot capture is
+            // deliberately NOT approval-gated (legacy behavior): providers restore a
+            // minimized target through their own inner activateWindow before
+            // capturing, which never passes through this guard. The interactive
+            // `computer_activate_window` tool DOES pass through here, so raising an
+            // arbitrary window to the foreground (a phishing amplifier) asks first.
             approve: async (reason) => {
-                if (reason.startsWith('capture window') || reason.startsWith('activate window'))
+                if (reason.startsWith('capture window'))
                     return;
                 await approveAction(reason);
             },
@@ -179,13 +222,13 @@ export async function createObservation(windowId, value) {
     const window = await getWindow(id);
     const { windowId: _ignored, ...rest } = value;
     void _ignored;
-    return createCoreObservation(window, rest, currentOwner);
+    return createCoreObservation(window, rest, activeOwner());
 }
 export async function validateObservation(observationId, windowId, action, options = {}) {
     const id = normalizeWindowId(windowId);
     return validateCoreObservation(observationId, id, await ensureGuarded(), action, {
         requireAccessibilityTree: options.requireAccessibilityTree,
-        owner: currentOwner,
+        owner: activeOwner(),
     });
 }
 async function actionObservation(observation, windowId, action, requireAccessibilityTree = false) {
@@ -249,9 +292,13 @@ async function syncOverlay(windowId = 0) {
         if (overlay.pulseTimer)
             clearInterval(overlay.pulseTimer);
         const native = await ensureProvider();
-        const pulse = native.refreshIndicator;
-        if (pulse)
+        // Invoke through the instance: detaching the method (`const pulse = native.refreshIndicator`)
+        // ran it with `this === undefined`, so every tick returned a rejected
+        // promise that the .catch() below swallowed — the pulse animation never ran.
+        const pulse = () => native.refreshIndicator?.() ?? Promise.resolve();
+        if (native.refreshIndicator) {
             overlay.pulseTimer = setInterval(() => { void pulse().catch(() => undefined); }, 100);
+        }
         overlay.timer = setTimeout(() => void hideOverlayNow(true), Math.max(1_000, overlay.config.overlayIdleMs));
     }
     catch { /* overlay is best effort */ }
@@ -296,7 +343,7 @@ export async function click(windowId, x, y, button, count, observation, coordina
         space = 'screen';
     }
     try {
-        const result = await runClick({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'click', windowId: id }, { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' });
+        const result = await runClick({ provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'click', windowId: id }, { x: px, y: py, button, count, coordinateSpace: space, clickMethod: options.clickMethod ?? 'auto' });
         await showOverlay(id);
         const details = result.details;
         return { clicked: true, x, y, screenX: details?.x, screenY: details?.y, method: result.method };
@@ -313,7 +360,8 @@ export async function typeText(windowId, value, observation) {
     await assertSafeWindow(id, 'type');
     if (value.length > 20_000)
         throw new ComputerUseError('INPUT_TOO_LARGE', 'A single input supports at most 20000 characters', 'DENY');
-    const result = await runTypeText({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'type', windowId: id, clipboardKey: `${currentOwner.sessionId}:${currentOwner.agentId}` }, value);
+    const owner = activeOwner();
+    const result = await runTypeText({ provider: await ensureGuarded(), observation, owner, action: 'type', windowId: id, clipboardKey: `${owner.sessionId}:${owner.agentId}` }, value);
     await showOverlay(id);
     return { typed: true, chars: value.length, method: result.method };
 }
@@ -331,6 +379,10 @@ const FORBIDDEN_CHORDS = [
 function isForbiddenChord(mods, main) {
     return FORBIDDEN_CHORDS.some((c) => c.key === main && c.mods.every((m) => mods.includes(m)));
 }
+// Main keys that leak beyond the target window even without modifiers:
+// PrintScreen copies the whole multi-monitor desktop into the shared clipboard,
+// which breaks this plugin's window-isolated capture promise.
+const FORBIDDEN_MAIN_KEYS = new Set(['printscreen']);
 export async function pressKey(windowId, value, observation) {
     const id = normalizeWindowId(windowId);
     await actionObservation(observation, id, 'press key');
@@ -345,7 +397,9 @@ export async function pressKey(windowId, value, observation) {
     const main = tokens.pop();
     if (isForbiddenChord(tokens, main))
         throw new ComputerUseError('FORBIDDEN_KEY', 'System shortcut combinations are not allowed', 'DENY');
-    const result = await runPressKey({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'press key', windowId: id }, value);
+    if (FORBIDDEN_MAIN_KEYS.has(main))
+        throw new ComputerUseError('FORBIDDEN_KEY', 'Full-screen capture keys are not allowed', 'DENY');
+    const result = await runPressKey({ provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'press key', windowId: id }, value);
     await showOverlay(id);
     return { pressed: true, key: value, modifiers: result.details?.modifiers ?? 0 };
 }
@@ -368,7 +422,7 @@ export async function scroll(windowId, x, y, scrollX, scrollY, observation, coor
         py = center.y;
         space = 'screen';
     }
-    const result = await runScroll({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'scroll', windowId: id }, { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space });
+    const result = await runScroll({ provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'scroll', windowId: id }, { x: px, y: py, scrollX: dx, scrollY: dy, coordinateSpace: space });
     await showOverlay(id);
     const details = result.details;
     return { scrolled: true, x, y, scrollX: details?.scrollX ?? dx, scrollY: details?.scrollY ?? dy, method: result.method };
@@ -386,7 +440,7 @@ export async function drag(windowId, fromX, fromY, toX, toY, observation, coordi
     if (options.fromElementIndex !== undefined || options.toElementIndex !== undefined) {
         await actionObservation(observation, id, 'drag', true);
     }
-    const result = await runDrag({ provider: await ensureGuarded(), observation, owner: currentOwner, action: 'drag', windowId: id }, { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' });
+    const result = await runDrag({ provider: await ensureGuarded(), observation, owner: activeOwner(), action: 'drag', windowId: id }, { fromX: a.x, fromY: a.y, toX: b.x, toY: b.y, coordinateSpace: 'screen' });
     await showOverlay(id);
     return { dragged: true, from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, method: result.method };
 }

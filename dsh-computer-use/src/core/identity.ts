@@ -46,6 +46,12 @@ export function parseWindowId(id: WindowId): ParsedWindowId | null {
 export function extractLegacyHwnd(id: WindowId): number | undefined {
   if (!id.startsWith(HWND_PREFIX)) return undefined
   const raw = id.slice(HWND_PREFIX.length)
-  if (!/^[0-9a-fA-F]+$/.test(raw)) return undefined
-  return Number.parseInt(raw, 16)
+  // A HWND fits in 16 hex digits (64 bits); anything longer parses to a
+  // non-integral double that would silently truncate inside the native layer.
+  if (raw.length > 16 || !/^[0-9a-fA-F]+$/.test(raw)) return undefined
+  const value = Number.parseInt(raw, 16)
+  // Even within 64 bits, values above 2^53 lose precision as JS numbers and
+  // would arrive at the native layer as a different handle than observed.
+  if (!Number.isSafeInteger(value)) return undefined
+  return value
 }

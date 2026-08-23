@@ -38,6 +38,7 @@ import type {
 } from '../../core/types.ts'
 
 import { resolveKeyCode } from './keymap.ts'
+import { META_KEY_TOKENS } from '../../core/types.ts'
 const TREE_MAX_NODES = 2000
 const TREE_MAX_DEPTH = 32
 
@@ -103,7 +104,10 @@ const FORBIDDEN_MAC_CHORDS: { mods: string[]; key: string }[] = [
   { mods: ['ctrl'], key: 'esc' },
   { mods: ['ctrl', 'shift'], key: 'esc' },
 ]
-const META_MODIFIERS = new Set(['win', 'windows', 'meta', 'cmd', 'command', 'super', 'os'])
+// Shared token set (covers X11 keysym spellings and defensive aliases too);
+// a duplicated short list here would drift out of sync with the other
+// providers' filters.
+const META_MODIFIERS: ReadonlySet<string> = META_KEY_TOKENS
 function isForbiddenMacChord(mods: string[], main: string): boolean {
   return FORBIDDEN_MAC_CHORDS.some((c) => c.key === main && c.mods.every((m) => mods.includes(m)))
 }
@@ -237,7 +241,11 @@ export class MacosProvider implements DesktopProvider {
         return { ok: true, method: 'clipboard-paste', details: { chars: request.text.length } }
       }
     } finally {
-      if (saved) native.restoreClipboard(key)
+      if (saved && !native.restoreClipboard(key)) {
+        // A failed restore would leave the just-typed (possibly secret) text on
+        // the shared pasteboard; wiping is the safe fallback.
+        try { native.setClipboardText('') } catch { /* best effort */ }
+      }
     }
     // Mirror the Windows cap: the per-char injection fallback must stay
     // bounded in case a native implementation paces keystrokes.
@@ -351,6 +359,12 @@ export class MacosProvider implements DesktopProvider {
 
   async dispose(): Promise<void> {
     await this.stopIndicator().catch(() => undefined)
+    // Release pasteboard snapshots captured by paste flows whose session
+    // ended without a restore (same teardown the Windows provider does).
+    try {
+      const native = await this.native().catch(() => null)
+      native?.clearClipboardSnapshots()
+    } catch { /* best effort */ }
   }
 
   private async toScreenPoint(request: { windowId: string; x: number; y: number; coordinateSpace?: string }): Promise<{ x: number; y: number }> {

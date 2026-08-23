@@ -39,7 +39,7 @@ export type Observation = WindowState & {
     sessionId: string;
     agentId: string;
 };
-interface ApprovalExec {
+export interface ApprovalExec {
     agent?: unknown;
     name: string;
     callId: unknown;
@@ -57,6 +57,18 @@ interface RuntimeHooks {
 export declare function initRuntime(h: RuntimeHooks): void;
 /** Attach the executing tool call so approval questions carry the right ids. */
 export declare function setApprovalContext(exec: ApprovalExec): void;
+/**
+ * Session/agent scope for observation isolation and approval identity. Read
+ * defensively so a missing field degrades to a stable "unknown" scope.
+ */
+export declare function sessionScopeOf(exec: ApprovalExec | undefined): ObservationOwner;
+/** Run `fn` with `exec` (and its derived observation owner) bound to the call chain. */
+export declare function runWithCallContext<T>(exec: ApprovalExec, fn: () => Promise<T> | T): Promise<T> | T;
+/** Internal: the active call context; tests verify chain isolation. */
+export declare function __activeCallContextForTest(): {
+    exec: ApprovalExec;
+    owner: ObservationOwner;
+} | null;
 /** Owner used for observations/approval; set from the tool exec context. */
 export declare function setObservationOwner(owner: ObservationOwner): void;
 export declare function observationOwner(): ObservationOwner;

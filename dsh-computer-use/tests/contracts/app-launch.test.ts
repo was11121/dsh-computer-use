@@ -38,6 +38,23 @@ test('launch hardening rejects path traversal and control characters', () => {
   blocked('evil\u001b.png')
 })
 
+test('launch hardening rejects NTFS 8.3 short names of blocked binaries', () => {
+  // A short name resolves to the long blocked binary at spawn time while
+  // matching no blocklist entry (audit: predictable counter bypass).
+  blocked('POWER~1.EXE')
+  blocked('C:\\Windows\\System32\\RUNDLL~1.EXE')
+  blocked('python~1')
+  blocked('node~2.exe')
+})
+
+test('launch hardening rejects bare names that start with a dash (argv wrapper options)', () => {
+  blocked('-a')
+  blocked('--args')
+  // Paths that merely contain a dash after a separator stay launchable.
+  const ok = checkLaunchApp('C:\\tools\\-reader\\app.exe')
+  assert.equal(ok.app, 'C:\\tools\\-reader\\app.exe')
+})
+
 test('launch hardening rejects empty applications', () => {
   blocked('')
   blocked('   ')
@@ -83,4 +100,76 @@ test('launch hardening still allows plain executables and extensionless names', 
   assert.equal(checkLaunchApp('calc.exe').app, 'calc.exe')
   assert.equal(checkLaunchApp('C:\\Program Files\\Microsoft VS Code\\Code.exe').app, 'C:\\Program Files\\Microsoft VS Code\\Code.exe')
   assert.equal(checkLaunchApp('notepad').app, 'notepad')
+})
+
+test('launch hardening blocks argv-driven execution wrappers', () => {
+  // A wrapper that executes a command taken from its arguments defeats the
+  // shell blocklist (`env bash -c ...`), so the wrappers themselves are
+  // blocked regardless of how their target is spelled.
+  for (const app of [
+    'env', 'env.exe', '/usr/bin/env',
+    'nohup', 'setsid', 'stdbuf', 'timeout', 'watch', 'xargs', 'nice', 'flock', 'taskset',
+    'sudo', 'su', 'doas', 'pkexec',
+    'systemd-run', 'systemctl',
+    'find', '/usr/bin/find', 'awk', 'gawk', 'sed', 'make', 'git', 'ssh', 'expect', 'tclsh',
+  ]) {
+    blocked(app)
+  }
+})
+
+test('launch hardening blocks Windows execution vehicles', () => {
+  blocked('wsl')
+  blocked('wsl.exe')
+  blocked('C:\\Windows\\System32\\wsl.exe')
+  blocked('explorer.exe')
+  blocked('C:\\Windows\\explorer.exe')
+  blocked('schtasks.exe')
+  blocked('forfiles.exe')
+  blocked('msbuild.exe')
+  blocked('installutil.exe')
+  blocked('msxsl.exe')
+  blocked('pcalua.exe')
+})
+
+test('launch hardening blocks runtimes that execute argv files', () => {
+  blocked('java')
+  blocked('javaw.exe')
+  blocked('jshell')
+  blocked('dotnet')
+  blocked('mono')
+  blocked('electron.exe')
+})
+
+test('launch hardening blocks document openers that resolve arbitrary handlers', () => {
+  blocked('open')
+  blocked('xdg-open')
+  blocked('gio')
+  blocked('gvfs-open')
+})
+
+test('launch hardening blocks versioned and suffixed interpreter stems', () => {
+  blocked('python3.13')
+  blocked('python3.13.exe')
+  blocked('pythonw')
+  blocked('pypy3')
+  blocked('perl5.36.0')
+  blocked('ruby3.2')
+  blocked('php8.2')
+  blocked('lua5.4')
+  blocked('node22')
+  blocked('deno1.46')
+})
+
+test('launch hardening blocks shell-executed document types by extension', () => {
+  blocked('/home/me/app.desktop')
+  blocked('/home/me/run.command')
+  blocked('/home/me/task.terminal')
+  blocked('/home/me/script.scpt')
+  blocked('/home/me/rule.applescript')
+  blocked('/home/me/flow.workflow')
+  blocked('C:\\Users\\me\\Downloads\\app.msix')
+  blocked('C:\\Users\\me\\Downloads\\pkg.appxbundle')
+  blocked('C:\\Users\\me\\Downloads\\site.jnlp')
+  blocked('C:\\Users\\me\\Downloads\\payload.settingcontent-ms')
+  blocked('/tmp/installer.run')
 })

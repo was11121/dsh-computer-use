@@ -29,6 +29,10 @@ export const META_KEY_TOKENS = new Set([
     'leftmeta', 'rightmeta', 'leftsuper', 'rightsuper',
     'lmeta', 'rmeta',
     'hyper', 'hyper_l', 'hyper_r',
+    // Defensive aliases seen in model output / other key naming schemes: not
+    // real keysyms everywhere, but blocking them costs nothing and keeps every
+    // provider's filter in lockstep with this shared set.
+    'win_l', 'win_r', 'os_l', 'os_r', 'leftos', 'rightos', 'loption', 'roption',
 ]);
 /** Convenience: map a CapabilityState to a boolean/unavailable error. */
 export function assertCapability(state, capability) {
